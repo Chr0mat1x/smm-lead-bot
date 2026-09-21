@@ -1,0 +1,9 @@
+.env
+data/
+*.sqlite3
+*.session
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+leads_export.csv
