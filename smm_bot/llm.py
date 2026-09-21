@@ -53,11 +53,18 @@ class BaseLLM:
 
 
 class OpenAICompatibleLLM(BaseLLM):
-    """POST /chat/completions — формат, который поддерживают почти все."""
+    """POST /chat/completions — формат, который поддерживают почти все.
 
-    def __init__(self, api_key: str, base_url: str, model: str, timeout: int = 60) -> None:
+    endpoint можно задать целиком: некоторые сервисы (Pollinations) отдают
+    chat completions не по /chat/completions, а по своему пути.
+    Ключ может быть пустым — тогда заголовок авторизации не отправляем.
+    """
+
+    def __init__(self, api_key: str, base_url: str, model: str, timeout: int = 60,
+                 endpoint: str | None = None) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
+        self.endpoint = endpoint or f"{self.base_url}/chat/completions"
         self.model = model
         self.timeout = timeout
         self.session = requests.Session()
@@ -67,13 +74,12 @@ class OpenAICompatibleLLM(BaseLLM):
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         try:
-            resp = self.session.post(
-                f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=self.timeout,
-            )
+            resp = self.session.post(self.endpoint, headers=headers, json=payload,
+                                     timeout=self.timeout)
         except requests.RequestException as exc:
             raise LLMError(f"LLM недоступен: {exc}") from exc
 
@@ -165,8 +171,19 @@ class NoLLM(BaseLLM):
         )
 
 
+POLLINATIONS_ENDPOINT = "https://text.pollinations.ai/openai"
+POLLINATIONS_MODEL = "openai-fast"  # GPT-OSS 20B, поддерживает вызов инструментов
+
+
 def build_llm() -> BaseLLM:
     provider = (settings.llm_provider or "none").lower()
+
+    # бесплатный режим: ключ не нужен вообще
+    if provider == "pollinations":
+        return OpenAICompatibleLLM("", POLLINATIONS_ENDPOINT,
+                                   settings.llm_model or POLLINATIONS_MODEL,
+                                   endpoint=POLLINATIONS_ENDPOINT)
+
     if provider == "none" or not settings.llm_api_key:
         return NoLLM()
     if provider == "anthropic":
