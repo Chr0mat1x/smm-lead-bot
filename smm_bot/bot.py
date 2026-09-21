@@ -117,6 +117,10 @@ def format_lead(lead: Lead, position: str = "") -> str:
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
+    user = message.from_user
+    if user:
+        log.info("Кто-то запустил бота: id=%s username=@%s name=%s",
+                 user.id, user.username, user.full_name)
     if not is_allowed(message):
         await message.answer("Бот приватный.")
         return
