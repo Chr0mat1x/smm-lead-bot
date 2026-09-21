@@ -44,6 +44,13 @@ class Settings:
     daily_send_limit: int = _int(os.getenv("DAILY_SEND_LIMIT"), 15)
     min_seconds_between_sends: int = _int(os.getenv("MIN_SECONDS_BETWEEN_SENDS"), 120)
 
+    # LLM для диалога и генерации сообщений
+    llm_provider: str = os.getenv("LLM_PROVIDER", "none")
+    llm_api_key: str = os.getenv("LLM_API_KEY", "")
+    llm_base_url: str = os.getenv("LLM_BASE_URL", "")
+    llm_model: str = os.getenv("LLM_MODEL", "")
+    llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.7") or 0.7)
+
     allowed_user_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:

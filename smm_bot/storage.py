@@ -43,6 +43,24 @@ CREATE TABLE IF NOT EXISTS send_log (
     sent_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_send_log_date ON send_log(sent_at);
+
+CREATE TABLE IF NOT EXISTS dialogue (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    INTEGER NOT NULL,
+    role       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    lead_key   TEXT DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dialogue_chat ON dialogue(chat_id, id);
+
+-- связка "сообщение бота в чате" -> лид, чтобы обрабатывать reply
+CREATE TABLE IF NOT EXISTS message_links (
+    chat_id    INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    lead_key   TEXT NOT NULL,
+    PRIMARY KEY (chat_id, message_id)
+);
 """
 
 
@@ -161,6 +179,47 @@ class Storage:
         with self._conn() as conn:
             row = conn.execute("SELECT sent_at FROM send_log ORDER BY id DESC LIMIT 1").fetchone()
         return datetime.fromisoformat(row["sent_at"]) if row else None
+
+    # ---------- диалог с ассистентом ----------
+
+    def add_dialogue(self, chat_id: int, role: str, content: str, lead_key: str = "") -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO dialogue (chat_id, role, content, lead_key, created_at) VALUES (?,?,?,?,?)",
+                (chat_id, role, content, lead_key,
+                 datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")),
+            )
+
+    def get_dialogue(self, chat_id: int, limit: int = 20) -> list[dict[str, str]]:
+        """Последние сообщения в прямом порядке: старые -> новые."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT role, content FROM dialogue WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+                (chat_id, limit),
+            ).fetchall()
+        return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+    def clear_dialogue(self, chat_id: int) -> int:
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM dialogue WHERE chat_id = ?", (chat_id,))
+        return cur.rowcount
+
+    # ---------- привязка сообщений к лидам ----------
+
+    def link_message(self, chat_id: int, message_id: int, lead_key: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO message_links (chat_id, message_id, lead_key) VALUES (?,?,?)",
+                (chat_id, message_id, lead_key),
+            )
+
+    def lead_key_for_message(self, chat_id: int, message_id: int) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT lead_key FROM message_links WHERE chat_id = ? AND message_id = ?",
+                (chat_id, message_id),
+            ).fetchone()
+        return row["lead_key"] if row else None
 
 
 def _row_to_lead(row: sqlite3.Row) -> Lead:

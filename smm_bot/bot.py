@@ -18,7 +18,9 @@ from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, KeyboardButton, Message,
                            ReplyKeyboardMarkup)
 
+from .agent import Agent
 from .config import settings
+from .llm import build_llm
 from .models import Channel, Lead, LeadStatus
 from .pipeline import export_leads_csv, prepare_messages, run_discovery
 from .scoring import CATEGORY_WEIGHT
@@ -84,6 +86,12 @@ def lead_keyboard(index: int) -> InlineKeyboardMarkup:
 # Кэш текущей выдачи, чтобы кнопки ссылались на конкретные лиды.
 current_batch: dict[int, list[Lead]] = {}
 
+# чаты, которые сейчас ждут от нас название города
+pending_city: set[int] = set()
+
+# LLM и ассистент (могут быть в режиме без ключа — тогда работает запасная логика)
+agent = Agent(storage, build_llm())
+
 
 def format_lead(lead: Lead, position: str = "") -> str:
     contact_lines = []
@@ -138,8 +146,12 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "/start — меню\n"
         "/find Москва — найти клиентов в городе\n"
+        "/ask вопрос — спросить ассистента\n"
+        "/reset — очистить историю диалога\n"
         "/stats — статистика базы\n"
         "/csv — выгрузить лиды в файл\n\n"
+        "Просто напишите вопрос словами — ассистент ответит.\n"
+        "Ответьте (reply) на карточку лида и напишите, что не так — он поправит.\n\n"
         "❗️ Перед отправкой проверьте: у человека должно быть согласие на получение "
         "сообщений, либо вы пишете не рекламу, а личное деловое предложение с возможностью отказа.",
         reply_markup=main_menu(),
@@ -188,6 +200,7 @@ async def do_discovery(message: Message, place: str) -> None:
 async def find_clients(message: Message) -> None:
     if not is_allowed(message):
         return
+    pending_city.add(message.chat.id)
     await message.answer("Напишите город, например: Тюмень или Тюмень, Центральный район")
 
 
@@ -217,11 +230,13 @@ async def show_next_leads(message: Message, place: str | None = None, batch_size
     current_batch[message.chat.id] = leads
     await message.answer(
         f"Показываю {len(leads)} лид(ов) с наивысшим приоритетом. "
-        "Проверьте сообщение и либо отправьте вручную, либо отметьте статус."
+        "Проверьте сообщение и либо отправьте вручную, либо отметьте статус.\n"
+        "Если контакт не тот — ответьте (reply) на карточку и напишите, что не так."
     )
     for index, lead in enumerate(leads):
-        await message.answer(format_lead(lead, position=f"{index + 1}. "),
-                             parse_mode="HTML", reply_markup=lead_keyboard(index))
+        sent = await message.answer(format_lead(lead, position=f"{index + 1}. "),
+                                    parse_mode="HTML", reply_markup=lead_keyboard(index))
+        storage.link_message(message.chat.id, sent.message_id, lead.key)
 
 
 @dp.callback_query(F.data.startswith("lead:"))
@@ -268,12 +283,66 @@ async def export_button(message: Message) -> None:
     await message.answer_document(FSInputFile(path), caption=f"Выгрузка лидов, всего в базе: {storage.total()}")
 
 
-@dp.message(F.text.regexp(r"^[\w\s\-,\.]{2,60}$"))
-async def city_input(message: Message) -> None:
-    """Свободный текст трактуем как название города."""
+@dp.message(Command("ask"))
+async def ask_cmd(message: Message) -> None:
+    """Явно поговорить с ассистентом."""
     if not is_allowed(message):
         return
-    await do_discovery(message, message.text.strip())
+    question = message.text.removeprefix("/ask").strip()
+    await talk_to_agent(message, question or "Что сейчас в базе?")
+
+
+@dp.message(Command("reset"))
+async def reset_cmd(message: Message) -> None:
+    """Забыть историю диалога."""
+    if not is_allowed(message):
+        return
+    removed = storage.clear_dialogue(message.chat.id)
+    agent.toolbox.last_shown = []
+    await message.answer(f"Историю диалога очистил ({removed} сообщ.). Контекст начат заново.")
+
+
+async def talk_to_agent(message: Message, text: str) -> None:
+    """Отправить сообщение ассистенту и показать ответ."""
+    context_lead_key = None
+    replied = message.reply_to_message
+    if replied:
+        context_lead_key = storage.lead_key_for_message(message.chat.id, replied.message_id)
+
+    note = await message.answer("Думаю…")
+    try:
+        answer = await asyncio.to_thread(agent.respond, message.chat.id, text, context_lead_key)
+    except Exception as exc:  # noqa: BLE001 — показываем причину, не роняем бота
+        log.exception("agent failed")
+        await note.edit_text(f"Не получилось ответить: {exc}")
+        return
+    await note.edit_text(render_answer(answer))
+
+
+def render_answer(text: str) -> str:
+    """Ответ ассистента может содержать что угодно — экранируем и режем длину."""
+    safe = html.escape(text)
+    if len(safe) > 3800:
+        safe = safe[:3800] + "…"
+    return safe
+
+
+@dp.message(F.text)
+async def free_text(message: Message) -> None:
+    """Любой текст: либо название города, либо вопрос ассистенту."""
+    if not is_allowed(message):
+        return
+    text = (message.text or "").strip()
+    if not text:
+        return
+
+    if message.chat.id in pending_city and not text.endswith("?"):
+        pending_city.discard(message.chat.id)
+        await do_discovery(message, text)
+        return
+
+    pending_city.discard(message.chat.id)
+    await talk_to_agent(message, text)
 
 
 async def main() -> None:
