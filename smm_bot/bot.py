@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 
 from aiogram import Bot, Dispatcher, F
@@ -102,12 +103,15 @@ def format_lead(lead: Lead, position: str = "") -> str:
     location = ", ".join(x for x in [lead.city, lead.address] if x) or "адрес не указан"
     category = CATEGORY_LABELS.get(lead.category, lead.category or "—")
 
+    esc = html.escape
+    contacts = esc("\n".join(contact_lines))
+    body = esc(lead.message)
     return (
-        f"{position}*{lead.name}*\n"
-        f"{category} · {location}\n"
+        f"{position}<b>{esc(lead.name)}</b>\n"
+        f"{esc(category)} · {esc(location)}\n"
         f"Скор: {lead.score} · канал: {lead.best_channel.value}\n"
-        + "\n".join(contact_lines)
-        + f"\n\n💬 _Готовое сообщение:_\n{lead.message}"
+        f"{contacts}\n\n"
+        f"💬 <i>Готовое сообщение:</i>\n{body}"
     )
 
 
@@ -180,9 +184,7 @@ async def do_discovery(message: Message, place: str) -> None:
 async def find_clients(message: Message) -> None:
     if not is_allowed(message):
         return
-    await message.answer(
-        "Напишите город, например: `Тюмень` или `Тюмень, Центральный район`",
-    )
+    await message.answer("Напишите город, например: Тюмень или Тюмень, Центральный район")
 
 
 @dp.message(Command("find"))
@@ -215,7 +217,7 @@ async def show_next_leads(message: Message, place: str | None = None, batch_size
     )
     for index, lead in enumerate(leads):
         await message.answer(format_lead(lead, position=f"{index + 1}. "),
-                             parse_mode="Markdown", reply_markup=lead_keyboard(index))
+                             parse_mode="HTML", reply_markup=lead_keyboard(index))
 
 
 @dp.callback_query(F.data.startswith("lead:"))
