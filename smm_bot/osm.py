@@ -21,6 +21,9 @@ import requests
 from .models import Lead
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "osm_cache"
+# Координаты городов кешируем отдельно и кладём в репозиторий: на хостинге
+# Nominatim часто блокирует облачный IP, а этот кеш делает поиск независимым.
+GEO_CACHE_DIR = Path(__file__).resolve().parent / "geo_cache"
 
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
@@ -29,7 +32,11 @@ OVERPASS_ENDPOINTS = [
 ]
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-USER_AGENT = "smm-lead-finder/0.1 (local tool)"
+PHOTON_URL = "https://photon.komoot.io/api/"
+USER_AGENT = "smm-lead-finder/0.2 (+https://github.com/Chr0mat1x/smm-lead-bot)"
+
+# Nominatim режет облачные IP (Render, VPS) и лимитирует 1 запрос/сек.
+# Поэтому кешируем координаты городов на диск и держим запасной геокодер.
 
 # Категории, которые вас интересуют: ключ — имя, значение — теги для Overpass.
 CATEGORY_PRESETS: dict[str, list[tuple[str, str]]] = {
@@ -63,21 +70,75 @@ class GeoArea:
         return f"{s},{w},{n},{e}"
 
 
-def geocode(place: str, timeout: int = 20) -> GeoArea:
-    """Название города/района -> bounding box через Nominatim."""
+def _geocode_nominatim(place: str, timeout: int) -> GeoArea | None:
     resp = requests.get(
         NOMINATIM_URL,
         params={"q": place, "format": "json", "limit": 1},
         headers={"User-Agent": USER_AGENT},
         timeout=timeout,
     )
+    if resp.status_code == 429:  # превышен лимит — не ошибка места, а отказ сервера
+        return None
     resp.raise_for_status()
     data = resp.json()
     if not data:
-        raise ValueError(f"Не удалось найти место: {place}")
-    item = data[0]
-    s, n, w, e = (float(x) for x in item["boundingbox"])  # [south, north, west, east]
+        return None
+    s, n, w, e = (float(x) for x in data[0]["boundingbox"])
     return GeoArea(query=place, bbox=(s, w, n, e))
+
+
+def _geocode_photon(place: str, timeout: int) -> GeoArea | None:
+    """Запасной геокодер. Отдаёт точку + границы, поэтому сами расширяем
+    точку до небольшой рамки — для поиска организаций этого достаточно."""
+    resp = requests.get(
+        PHOTON_URL,
+        params={"q": place, "limit": 1},
+        headers={"User-Agent": USER_AGENT},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    features = resp.json().get("features", [])
+    if not features:
+        return None
+    props = features[0]
+    extent = props.get("properties", {}).get("extent")
+    if extent and len(extent) == 4:  # [west, north, east, south]
+        w, n, e, s = (float(x) for x in extent)
+        return GeoArea(query=place, bbox=(s, w, n, e))
+    lon, lat = props["geometry"]["coordinates"]
+    pad = 0.12  # примерно 13 км — город целиком
+    return GeoArea(query=place, bbox=(lat - pad, lon - pad, lat + pad, lon + pad))
+
+
+def geocode(place: str, timeout: int = 20, retries: int = 3, use_cache: bool = True) -> GeoArea:
+    """Название города/района -> bounding box.
+
+    Идём по цепочке: кеш -> Nominatim (с повторами) -> Photon. Так одна
+    перегруженная служба не срывает поиск, что особенно важно на хостинге.
+    """
+    cache_file = GEO_CACHE_DIR / f"geo_{hashlib.sha256(place.strip().lower().encode()).hexdigest()[:16]}.json"
+    if use_cache and cache_file.exists():
+        s, w, n, e = json.loads(cache_file.read_text(encoding="utf-8"))
+        return GeoArea(query=place, bbox=(s, w, n, e))
+
+    last_error: Exception | None = None
+    for attempt in range(retries):
+        for lookup in (_geocode_nominatim, _geocode_photon):
+            try:
+                area = lookup(place, timeout)
+            except requests.RequestException as exc:
+                last_error = exc
+                continue
+            except (KeyError, ValueError, TypeError) as exc:
+                last_error = exc
+                continue
+            if area is not None:
+                if use_cache:
+                    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    cache_file.write_text(json.dumps(list(area.bbox)), encoding="utf-8")
+                return area
+        time.sleep(1.5 * (attempt + 1))  # не долбим сервис при отказе
+    raise RuntimeError(f"Не удалось определить координаты «{place}»: {last_error}")
 
 
 def build_query(area: GeoArea, categories: list[str]) -> str:
