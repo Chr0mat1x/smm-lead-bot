@@ -70,6 +70,14 @@ class Storage:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Догоняем схему старых баз: CREATE TABLE IF NOT EXISTS не добавляет колонки."""
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(leads)")}
+        if "shown_at" not in columns:
+            conn.execute("ALTER TABLE leads ADD COLUMN shown_at TEXT")
 
     @contextmanager
     def _conn(self):
@@ -130,17 +138,65 @@ class Storage:
         return _row_to_lead(row) if row else None
 
     def list_leads(self, status: LeadStatus | None = None, limit: int = 10,
-                   order: str = "score DESC, created_at DESC") -> list[Lead]:
+                   order: str = "score DESC, created_at DESC",
+                   city: str | None = None, unseen_only: bool = False) -> list[Lead]:
+        """Список лидов с фильтрами.
+
+        Фильтр city обязателен при показе после поиска: без него всплывают
+        старые лиды других городов с более высоким скором, и выглядит это
+        так, будто бот искал в Санкт-Петербурге вместо Саратова.
+        """
         query = "SELECT * FROM leads"
+        where: list[str] = []
         params: list = []
         if status:
-            query += " WHERE status = ?"
+            where.append("status = ?")
             params.append(status.value)
+        if city:
+            where.append("city LIKE ?")
+            params.append(f"%{city.strip()}%")
+        if unseen_only:
+            where.append("(shown_at IS NULL OR shown_at = '')")
+        if where:
+            query += " WHERE " + " AND ".join(where)
         query += f" ORDER BY {order} LIMIT ?"
         params.append(limit)
         with self._conn() as conn:
             rows = conn.execute(query, params).fetchall()
         return [_row_to_lead(r) for r in rows]
+
+    def find_by_city(self, city: str, status: LeadStatus | None = None,
+                     unseen_only: bool = False) -> list[Lead]:
+        """Все лиды города — чтобы «Следующие лиды» не уезжали в другой город.
+
+        Город в базе хранится в именительном падеже («Саратов»), а приходит
+        из чата падеж («Саратове») — поэтому перебираем варианты написания.
+        """
+        from .osm import name_variants  # локальный импорт против цикла
+
+        for name in name_variants(city):
+            found = self.list_leads(status=status, limit=10000, city=name,
+                                    unseen_only=unseen_only)
+            if found:
+                return found
+        return []
+
+    def reset_shown_for_city(self, city: str) -> None:
+        """Новый поиск по городу — показываем лучших заново, с первого лида."""
+        if not city:
+            return
+        with self._conn() as conn:
+            conn.execute("UPDATE leads SET shown_at = NULL WHERE city LIKE ?",
+                         (f"%{city.strip()}%",))
+
+    def mark_shown(self, keys: list[str]) -> None:
+        """Помечаем показанные лиды, чтобы при следующем нажатии шли новые."""
+        if not keys:
+            return
+        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+        with self._conn() as conn:
+            conn.executemany("UPDATE leads SET shown_at = ? WHERE key = ?",
+                             [(now, key) for key in keys])
 
     def set_status(self, key: str, status: LeadStatus) -> None:
         with self._conn() as conn:

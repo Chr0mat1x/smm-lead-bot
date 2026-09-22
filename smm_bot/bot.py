@@ -90,6 +90,10 @@ current_batch: dict[int, list[Lead]] = {}
 # чаты, которые сейчас ждут от нас название города
 pending_city: set[int] = set()
 
+# город последнего поиска: «Следующие лиды» должны добирать тот же город,
+# а не подмешивать старые лиды из других городов
+active_city: dict[int, str] = {}
+
 # LLM и ассистент (могут быть в режиме без ключа — тогда работает запасная логика)
 agent = Agent(storage, build_llm())
 
@@ -193,8 +197,14 @@ async def do_discovery(message: Message, place: str) -> None:
         log.exception("discovery failed")
         await note.edit_text(f"Не получилось: {exc}\n\nПопробуйте другое название города.")
         return
-    await note.edit_text(f"Готово по «{place}»:\n\n{stats.as_text()}")
-    await show_next_leads(message, place=place)
+    # stats.city — каноническое название от геокодера: показываем «Саратов»,
+    # а не «Саратове», и по нему же фильтруем выдачу
+    active_city[message.chat.id] = stats.city or place
+    # Новый поиск по городу начинаем с лучших лидов, а не с того места,
+    # где остановились в прошлый раз.
+    storage.reset_shown_for_city(active_city[message.chat.id])
+    await note.edit_text(f"Готово по «{stats.city or place}»:\n\n{stats.as_text()}")
+    await show_next_leads(message, place=stats.city or place)
 
 
 @dp.message(F.text == "🔍 Найти клиентов")
@@ -218,26 +228,54 @@ async def find_cmd(message: Message) -> None:
 
 @dp.message(F.text == "📋 Следующие лиды")
 async def next_leads_button(message: Message) -> None:
-    await show_next_leads(message)
+    city = active_city.get(message.chat.id)
+    if not city:
+        await message.answer("Сначала поиск: /find Город — потом покажу следующие лиды.")
+        return
+    await show_next_leads(message, place=city)
 
 
 async def show_next_leads(message: Message, place: str | None = None, batch_size: int = 5) -> None:
     prepare_messages(storage)
-    leads = [l for l in storage.list_leads(status=LeadStatus.NEW, limit=batch_size) if l.reachable]
+    city = place or active_city.get(message.chat.id)
+    if not city:
+        await message.answer("Сначала поиск: /find Город — потом покажу лиды.")
+        return
+
+    def pick(unseen: bool) -> list[Lead]:
+        return [l for l in storage.find_by_city(city, status=LeadStatus.NEW, unseen_only=unseen)
+                if l.reachable][:batch_size]
+
+    # Сначала только непоказанные. Если в городе новых не осталось — берём
+    # уже показанные, чтобы человек мог вернуться к ним, а не получить молчание.
+    leads = pick(unseen=True)
+    repeat = False
     if not leads:
-        await message.answer("Новых лидов нет. Запустите поиск: /find Город")
+        leads = pick(unseen=False)
+        repeat = True
+    if not leads:
+        await message.answer(
+            f"По городу «{city}» новых лидов нет.\n"
+            "Попробуйте другой город или другую категорию."
+        )
         return
 
     current_batch[message.chat.id] = leads
+    # название берём у самого лида: там каноническая форма («Саратов»), а не падеж
+    shown_city = leads[0].city or city
+    header = f"Город: {shown_city}. Лиды {len(leads)} шт. по приоритету."
+    if repeat:
+        header += "\nЭто уже показанные ранее — новых по городу не осталось."
     await message.answer(
-        f"Показываю {len(leads)} лид(ов) с наивысшим приоритетом. "
-        "Проверьте сообщение и либо отправьте вручную, либо отметьте статус.\n"
+        header + "\nПроверьте сообщение и отправьте вручную. "
         "Если контакт не тот — ответьте (reply) на карточку и напишите, что не так."
     )
     for index, lead in enumerate(leads):
         sent = await message.answer(format_lead(lead, position=f"{index + 1}. "),
                                     parse_mode="HTML", reply_markup=lead_keyboard(index))
         storage.link_message(message.chat.id, sent.message_id, lead.key)
+    if not repeat:
+        storage.mark_shown([l.key for l in leads])
 
 
 @dp.callback_query(F.data.startswith("lead:"))

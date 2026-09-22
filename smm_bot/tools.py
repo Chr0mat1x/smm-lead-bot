@@ -175,6 +175,8 @@ class ToolBox:
         self.storage = storage
         # ключи лидов из последней выдачи — чтобы модель понимала «этот», «второй»
         self.last_shown: list[str] = []
+        # город последнего поиска: поиск по Саратову не должен показывать Питер
+        self.active_city: str = ""
 
     def schemas(self) -> list[dict[str, Any]]:
         return TOOL_SCHEMAS
@@ -198,11 +200,24 @@ class ToolBox:
             return {"ok": False, "result": "Не указан город."}
         categories = args.get("categories") or None
         stats = run_discovery(self.storage, city, categories)
-        leads = self.storage.list_leads(status=LeadStatus.NEW, limit=10)
+        self.active_city = stats.city or city
+        self.storage.reset_shown_for_city(self.active_city)
+
+        def pick(unseen: bool) -> list[Lead]:
+            return [l for l in self.storage.find_by_city(self.active_city, status=LeadStatus.NEW,
+                                                         unseen_only=unseen)
+                    if l.reachable][:10]
+
+        leads = pick(unseen=True)
+        if not leads:
+            leads = pick(unseen=False)
+        else:
+            self.storage.mark_shown([l.key for l in leads])
         self.last_shown = [l.key for l in leads]
+        city_label = leads[0].city if leads else self.active_city
         return {
             "ok": True,
-            "result": f"По городу {city}: {stats.as_text()}",
+            "result": f"По городу {city_label}: {stats.as_text()}",
             "data": {"stats": stats.__dict__, "shown_keys": self.last_shown},
         }
 
@@ -213,10 +228,14 @@ class ToolBox:
         except ValueError:
             status = LeadStatus.NEW
         limit = int(args.get("limit") or 5)
-        leads = [l for l in self.storage.list_leads(status=status, limit=limit) if l.reachable]
+        # Если недавно был поиск по городу — показываем из него, а не всю базу.
+        leads = [l for l in self.storage.list_leads(status=status, limit=limit,
+                                                    city=self.active_city or None)
+                 if l.reachable]
         self.last_shown = [l.key for l in leads]
         if not leads:
-            return {"ok": True, "result": f"Лидов со статусом {status.value} нет."}
+            where = f" по городу {self.active_city}" if self.active_city else ""
+            return {"ok": True, "result": f"Лидов со статусом {status.value}{where} нет."}
         lines = [f"{i+1}. {l.name} ({l.category}, {l.city}) — скор {l.score}, ключ {l.key}"
                  for i, l in enumerate(leads)]
         return {"ok": True, "result": "Найдены лиды:\n" + "\n".join(lines),

@@ -18,6 +18,7 @@ class DiscoveryStats:
     reachable: int = 0
     new: int = 0
     updated: int = 0
+    city: str = ""  # каноническое название (не падеж) — по нему фильтруем выдачу
 
     def as_text(self) -> str:
         return (
@@ -32,8 +33,10 @@ class DiscoveryStats:
 def run_discovery(storage: Storage, place: str, categories: list[str] | None = None,
                   your_name: str | None = None) -> DiscoveryStats:
     """Находит лиды, чистит, скорит, сохраняет и готовит сообщения."""
-    raw_leads = osm.discover(place, categories)
-    stats = DiscoveryStats(found_raw=len(raw_leads))
+    area = osm.geocode(place)
+    elements = osm.fetch(area, categories or osm.DEFAULT_CATEGORIES)
+    raw_leads = osm.parse_elements(elements, city=area.name or place)
+    stats = DiscoveryStats(found_raw=len(raw_leads), city=area.name or place)
 
     candidates = filter_no_website(raw_leads)
     stats.without_website = len(candidates)

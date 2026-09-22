@@ -163,3 +163,46 @@ def test_categories_may_arrive_as_string():
     # barber разворачивается в тег shop=hairdresser — важно, что категория принята
     comma = osm.build_query(area, "cafe, barber")
     assert "cafe" in comma and "hairdresser" in comma
+
+
+def _lead(key: str, city: str, score: int = 50) -> Lead:
+    return Lead(source="osm", source_id=key, name=f"Точка {key}", category="cafe",
+                city=city, phone="+7 900 000-00-00", score=score)
+
+
+def test_lead_listing_does_not_mix_cities(tmp_path) -> None:
+    """Поиск в Саратове не должен показывать лиды из Санкт-Петербурга.
+
+    Было так: «Следующие лиды» брали топ-5 по всей базе, и питерский лид
+    с высоким скором вылезал после поиска в Саратове.
+    """
+    storage = Storage(tmp_path / "t.sqlite3")
+    storage.upsert_lead(_lead("piter/1", "Санкт-Петербург", score=99))
+    storage.upsert_lead(_lead("piter/2", "Санкт-Петербург", score=98))
+    storage.upsert_lead(_lead("sar/1", "Саратов", score=10))
+
+    leads = [l for l in storage.find_by_city("Саратов", status=LeadStatus.NEW) if l.reachable]
+    assert [l.key for l in leads] == ["osm:sar/1"], "выдача уехала в другой город"
+
+
+def test_case_form_matches_canonical_city(tmp_path) -> None:
+    """В базе город хранится как «Саратов», а искать могут по «Саратове»."""
+    storage = Storage(tmp_path / "t.sqlite3")
+    storage.upsert_lead(_lead("sar/1", "Саратов"))
+    assert storage.find_by_city("Саратове", status=LeadStatus.NEW)
+
+
+def test_shown_leads_are_not_repeated(tmp_path) -> None:
+    """Показанные лиды не вылезают повторно, а новый поиск сбрасывает отметки."""
+    storage = Storage(tmp_path / "t.sqlite3")
+    for i in range(3):
+        storage.upsert_lead(_lead(f"sar/{i}", "Саратов", score=10 - i))
+
+    first = storage.find_by_city("Саратов", status=LeadStatus.NEW, unseen_only=True)
+    assert len(first) == 3
+    storage.mark_shown([l.key for l in first])
+    assert storage.find_by_city("Саратов", status=LeadStatus.NEW, unseen_only=True) == []
+
+    storage.reset_shown_for_city("Саратов")
+    again = storage.find_by_city("Саратов", status=LeadStatus.NEW, unseen_only=True)
+    assert len(again) == 3
