@@ -175,7 +175,8 @@ POLLINATIONS_ENDPOINT = "https://text.pollinations.ai/openai"
 POLLINATIONS_REFERRER = "smm-lead-bot"
 # Порядок важен: пробуем по очереди, пока какая-нибудь модель не ответит.
 # Без referrer у бесплатного режима сразу кончается квота анонимного ключа.
-POLLINATIONS_MODELS = ["openai", "openai-fast", "mistral"]
+# "mistral" больше не существует в API (404), а "openai" лишь алиас openai-fast.
+POLLINATIONS_MODELS = ["openai-fast", "openai"]
 POLLINATIONS_MODEL = POLLINATIONS_MODELS[0]  # совместимость с прежним именем
 
 
@@ -199,21 +200,25 @@ class PollinationsLLM(BaseLLM):
         low = reply.text.lower()
         return not reply.tool_calls and ("budget" in low or "rate limit" in low)
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> LLMReply:
+    def chat(self, messages: list[dict], tools: list[dict] | None = None,
+             attempts: int = 2) -> LLMReply:
         last: LLMReply | None = None
         errors: list[str] = []
         for model in self.models:
             client = OpenAICompatibleLLM("", POLLINATIONS_ENDPOINT, model,
                                          timeout=self.timeout, endpoint=self.endpoint)
-            try:
-                reply = client.chat(messages, tools)
-            except LLMError as exc:
-                errors.append(f"{model}: {exc}")
-                continue
-            if reply.tool_calls or not self._is_quota_refusal(reply):
-                return reply
-            last = reply
-            errors.append(f"{model}: отказ по квоте")
+            for _ in range(attempts):
+                try:
+                    reply = client.chat(messages, tools)
+                except LLMError as exc:
+                    # сервис отдаёт 400/500 и на валидном запросе, поэтому пробуем ещё
+                    errors.append(f"{model}: {exc}")
+                    continue
+                if reply.tool_calls or not self._is_quota_refusal(reply):
+                    return reply
+                last = reply
+                errors.append(f"{model}: отказ по квоте")
+                break  # квота — не наш случай, сразу берём следующую модель
         if last is not None:
             return last
         raise LLMError("Бесплатная модель недоступна: " + "; ".join(errors))

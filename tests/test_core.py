@@ -1,6 +1,7 @@
 """Тесты ядра: скоринг, дедупликация, генерация сообщений, парсинг OSM."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -97,3 +98,68 @@ def test_storage_send_limits(tmp_path) -> None:
     storage.log_send("osm:node/1", "telegram")
     assert storage.sent_today() == 1
     assert storage.last_send_ts() is not None
+
+
+def test_poisoned_cache_is_ignored(tmp_path, monkeypatch):
+    """Неполный ответ Overpass нельзя принимать за полные данные.
+
+    Именно это ломало поиск: в кеш попали 3 объекта вместо 452, и город
+    «находился» из трёх записей, пока кеш не удалишь руками.
+    """
+    from smm_bot import osm
+
+    monkeypatch.setattr(osm, "CACHE_DIR", tmp_path)
+    area = osm.GeoArea("Тюмень", (57.0, 65.2, 57.3, 65.8))
+    cache_file = osm._cache_path(osm.build_query(area, ["cafe"]))
+    cache_file.write_text(json.dumps([{"id": 1}, {"id": 2}, {"id": 3}]), encoding="utf-8")
+
+    fresh = [{"id": i} for i in range(50)]
+
+    class Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"elements": fresh}
+
+    monkeypatch.setattr(osm.requests, "post", lambda *a, **k: Resp())
+    assert osm.fetch(area, ["cafe"]) == fresh
+    assert json.loads(cache_file.read_text(encoding="utf-8")) == fresh
+
+
+def test_incomplete_overpass_answer_is_not_used(tmp_path, monkeypatch):
+    """Поле remark = сервер отдал часть данных; такой ответ не принимаем."""
+    from smm_bot import osm
+
+    monkeypatch.setattr(osm, "CACHE_DIR", tmp_path)
+    area = osm.GeoArea("Тюмень", (57.0, 65.2, 57.3, 65.8))
+
+    class Timeout:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"elements": [{"id": 1}], "remark": "runtime error: Query timed out"}
+
+    class Good:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"elements": [{"id": i} for i in range(20)]}
+
+    answers = [Timeout(), Good()]
+    monkeypatch.setattr(osm.requests, "post", lambda *a, **k: answers.pop(0))
+    monkeypatch.setattr(osm.time, "sleep", lambda *_: None)
+    assert len(osm.fetch(area, ["cafe"], retries=2)) == 20
+
+
+def test_categories_may_arrive_as_string():
+    """Нейросеть передаёт категорию строкой — раньше это роняло поиск."""
+    from smm_bot import osm
+
+    area = osm.GeoArea("Тюмень", (57.0, 65.2, 57.3, 65.8))
+    assert "cafe" in osm.build_query(area, "cafe")
+    # barber разворачивается в тег shop=hairdresser — важно, что категория принята
+    comma = osm.build_query(area, "cafe, barber")
+    assert "cafe" in comma and "hairdresser" in comma

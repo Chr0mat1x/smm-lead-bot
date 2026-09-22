@@ -35,6 +35,52 @@ def test_geocode_reads_from_cache_without_network():
         osm._geocode_nominatim, osm._geocode_photon = original
 
 
+def test_degenerate_cached_bbox_is_rejected(tmp_path, monkeypatch):
+    """Старые записи с рамкой-точкой («Тюмени») не должны приниматься."""
+    monkeypatch.setattr(osm, "GEO_CACHE_DIR", tmp_path)
+    import hashlib
+
+    key = hashlib.sha256("тюмени".encode()).hexdigest()[:16]
+    (tmp_path / f"geo_{key}.json").write_text(json.dumps([57.14, 65.56, 57.15, 65.56]),
+                                              encoding="utf-8")
+    original = (osm._geocode_nominatim, osm._geocode_photon)
+    osm._geocode_nominatim = lambda q, t: osm.GeoArea(q, (57.0, 65.2, 57.3, 65.8), "Тюмень")
+    osm._geocode_photon = lambda q, t: None
+    try:
+        area = osm.geocode("Тюмени", retries=1)
+        assert area.bbox == (57.0, 65.2, 57.3, 65.8), "точка из кеша не должна приниматься"
+        assert area.name == "Тюмень"
+    finally:
+        osm._geocode_nominatim, osm._geocode_photon = original
+
+
+def test_case_forms_are_tried():
+    """«найди в Тюмени» — нейросеть ставит падеж, геокодер его не понимает."""
+    assert osm.name_variants("Тюмени")[:2] == ["Тюмени", "Тюмен"]
+    assert "Тюмень" in osm.name_variants("Тюмени")
+    assert osm.name_variants("Ярославле")[-1] == "Ярославль"
+
+
+def test_case_form_found_in_cache_offline():
+    """«Тюмени» должно находиться из кеша, где лежит «Тюмень».
+
+    На хостинге геокодеры недоступны, а бот получает именно падеж.
+    """
+    def boom(*_a, **_k):
+        raise RuntimeError("сеть недоступна")
+
+    original = (osm._geocode_nominatim, osm._geocode_photon)
+    osm._geocode_nominatim, osm._geocode_photon = boom, boom
+    try:
+        for form, expected in [("Тюмени", "Тюмень"), ("Казани", "Казань"),
+                               ("Ярославле", "Ярославль")]:
+            area = osm.geocode(form)
+            assert area.name == expected, f"{form}: получено {area.name!r}"
+            assert osm.bbox_is_usable(area.bbox), f"{form}: рамка нулевой площади"
+    finally:
+        osm._geocode_nominatim, osm._geocode_photon = original
+
+
 def test_geocode_unknown_place_raises_clearly():
     """Неизвестное место — понятная ошибка, а не молчаливый ноль лидов."""
     original = (osm._geocode_nominatim, osm._geocode_photon)
@@ -91,6 +137,7 @@ def test_cache_file_written(tmp_path, monkeypatch):
         assert area.bbox == (1.0, 2.0, 3.0, 4.0)
         saved = list(tmp_path.glob("geo_*.json"))
         assert len(saved) == 1
-        assert json.loads(saved[0].read_text(encoding="utf-8")) == [1.0, 2.0, 3.0, 4.0]
+        payload = json.loads(saved[0].read_text(encoding="utf-8"))
+        assert payload["bbox"] == [1.0, 2.0, 3.0, 4.0]
     finally:
         osm._geocode_nominatim, osm._geocode_photon = original

@@ -122,14 +122,32 @@ def test_pollinations_retries_other_model_on_quota_refusal(monkeypatch) -> None:
 
     def fake_chat(self, messages, tools=None):
         calls.append(self.model)
-        if self.model == "openai":
+        if self.model == "openai-fast":
             return LLMReply(text="The API key used for this request has reached its budget.")
         return LLMReply(text="работаю")
 
     monkeypatch.setattr("smm_bot.llm.OpenAICompatibleLLM.chat", fake_chat)
-    reply = PollinationsLLM(["openai", "openai-fast"]).chat([{"role": "user", "content": "x"}])
+    reply = PollinationsLLM(["openai-fast", "openai"]).chat([{"role": "user", "content": "x"}])
     assert reply.text == "работаю"
-    assert calls == ["openai", "openai-fast"]
+    assert calls == ["openai-fast", "openai"]
+
+
+def test_pollinations_retries_same_model_on_transient_error(monkeypatch) -> None:
+    """Сервис отдаёт 400 и на корректном запросе — одну ошибку не считаем приговором."""
+    from smm_bot.llm import LLMError, LLMReply, PollinationsLLM
+
+    calls: list[str] = []
+
+    def fake_chat(self, messages, tools=None):
+        calls.append(self.model)
+        if len(calls) == 1:
+            raise LLMError("LLM вернул HTTP 400: Bad Request")
+        return LLMReply(text="со второй попытки получилось")
+
+    monkeypatch.setattr("smm_bot.llm.OpenAICompatibleLLM.chat", fake_chat)
+    reply = PollinationsLLM(["openai-fast"]).chat([{"role": "user", "content": "x"}])
+    assert reply.text == "с второй попытки получилось" or "второй" in reply.text
+    assert len(calls) == 2
 
 
 def test_pollinations_keeps_tool_call_even_with_odd_text(monkeypatch) -> None:
