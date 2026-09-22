@@ -103,6 +103,17 @@ cp .env.example .env   # и заполните TELEGRAM_BOT_TOKEN
 `ALLOWED_USER_IDS` — у [@userinfobot](https://t.me/userinfobot), чтобы бот не отвечал
 чужим.
 
+## Деплой (чтобы работал 24/7)
+
+Все варианты с пошаговыми инструкциями — в [deploy/README.md](deploy/README.md).
+Коротко:
+
+- **Render free** — бесплатно, но засыпает через 15 минут; лечится бесплатным
+  пингом `/health` раз в 5 минут (UptimeRobot). Инструкция в deploy/README.md.
+- **GitHub Actions** — вообще без сторонних аккаунтов, бот крутится прямо
+  в вашем репозитории. Workflow уже готов: `.github/workflows/bot.yml`.
+- **Свой VPS** — `sudo bash deploy/install.sh`, самый надёжный вариант.
+
 ## Запуск
 
 Бот:

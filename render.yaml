@@ -2,7 +2,8 @@ services:
   - type: web
     name: smm-bot
     runtime: python
-    plan: starter
+    # бесплатный тариф; на нём нет постоянного диска, база обнуляется при деплое
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python -m smm_bot.bot
     healthCheckPath: /health

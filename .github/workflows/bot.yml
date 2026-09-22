@@ -1,0 +1,58 @@
+name: Bot 24/7
+
+# Вариант без внешнего хостинга: бот гоняется прямо в GitHub Actions.
+#
+# Как включить:
+#   1) Settings -> Secrets and variables -> Actions -> New repository secret
+#      добавьте TELEGRAM_BOT_TOKEN (и при желании YOUR_NAME/YOUR_CONTACT);
+#      вашего Telegram ID добавьте сюда же как ALLOWED_USER_IDS.
+#   2) Settings -> Actions -> General -> Workflow permissions -> Read and write.
+#   3) Этот файл сработает по расписанию сам, либо запустите вручную
+#      (Actions -> Bot 24/7 -> Run workflow).
+#
+# Одна задача живёт максимум 6 часов, затем следующий запуск подхватывает
+# эстафету. Telegram хранит обновления и доставит их после перезапуска.
+
+on:
+  schedule:
+    # каждые 5 часов; шаг подобрал так, чтобы покрыть лимит в 6 часов
+    - cron: "0 */5 * * *"
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "Сколько часов держать бота (1-5)"
+        default: "5"
+
+concurrency:
+  # не запускаем второй экземпляр, пока работает первый
+  group: smm-bot
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355  # чуть меньше 6 часов — GitHub убивает задачу на 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Установить зависимости
+        run: pip install -r requirements.txt
+
+      - name: Запустить бота
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ALLOWED_USER_IDS: ${{ secrets.ALLOWED_USER_IDS }}
+          YOUR_NAME: ${{ vars.YOUR_NAME }}
+          YOUR_CONTACT: ${{ vars.YOUR_CONTACT }}
+          LLM_PROVIDER: pollinations
+          DB_PATH: data/leads.sqlite3
+        run: |
+          mkdir -p data
+          # ограничиваем время жизни, чтобы задача завершилась сама и не ловила kill
+          timeout "${TIMEOUT_SECONDS:-21000}" python -m smm_bot.bot || true
+        timeout-minutes: 350
