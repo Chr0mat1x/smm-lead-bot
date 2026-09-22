@@ -102,3 +102,43 @@ def test_http_error_raises_llm_error() -> None:
     capture(client, {"error": "nope"}, status_code=429)
     with pytest.raises(LLMError, match="429"):
         client.chat([{"role": "user", "content": "x"}])
+
+
+def test_pollinations_uses_referrer() -> None:
+    """Без referrer бесплатный режим отбивается сообщением про budget."""
+    from smm_bot.llm import POLLINATIONS_REFERRER, PollinationsLLM
+
+    llm = PollinationsLLM(["openai"])
+    assert "referrer=" in llm.endpoint
+    assert POLLINATIONS_REFERRER in llm.endpoint
+
+
+def test_pollinations_retries_other_model_on_quota_refusal(monkeypatch) -> None:
+    """Отказ по квоте приходит с HTTP 200 — распознаём по тексту и берём
+    следующую модель, а не отдаём владельцу сообщение про бюджет."""
+    from smm_bot.llm import LLMReply, PollinationsLLM
+
+    calls: list[str] = []
+
+    def fake_chat(self, messages, tools=None):
+        calls.append(self.model)
+        if self.model == "openai":
+            return LLMReply(text="The API key used for this request has reached its budget.")
+        return LLMReply(text="работаю")
+
+    monkeypatch.setattr("smm_bot.llm.OpenAICompatibleLLM.chat", fake_chat)
+    reply = PollinationsLLM(["openai", "openai-fast"]).chat([{"role": "user", "content": "x"}])
+    assert reply.text == "работаю"
+    assert calls == ["openai", "openai-fast"]
+
+
+def test_pollinations_keeps_tool_call_even_with_odd_text(monkeypatch) -> None:
+    """Вызов инструмента — успех, что бы ни было в тексте рядом с ним."""
+    from smm_bot.llm import LLMReply, PollinationsLLM, ToolCall
+
+    def fake_chat(self, messages, tools=None):
+        return LLMReply(text="budget", tool_calls=[ToolCall(id="1", name="stats", arguments={})])
+
+    monkeypatch.setattr("smm_bot.llm.OpenAICompatibleLLM.chat", fake_chat)
+    reply = PollinationsLLM(["openai"]).chat([{"role": "user", "content": "x"}])
+    assert reply.wants_tools

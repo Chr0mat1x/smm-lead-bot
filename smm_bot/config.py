@@ -45,7 +45,8 @@ class Settings:
     min_seconds_between_sends: int = _int(os.getenv("MIN_SECONDS_BETWEEN_SENDS"), 120)
 
     # LLM для диалога и генерации сообщений
-    llm_provider: str = os.getenv("LLM_PROVIDER", "none")
+    # по умолчанию бесплатный режим: он не требует ключа и нужен владельцу
+    llm_provider: str = os.getenv("LLM_PROVIDER", "pollinations")
     llm_api_key: str = os.getenv("LLM_API_KEY", "")
     llm_base_url: str = os.getenv("LLM_BASE_URL", "")
     llm_model: str = os.getenv("LLM_MODEL", "")

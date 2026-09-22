@@ -172,7 +172,51 @@ class NoLLM(BaseLLM):
 
 
 POLLINATIONS_ENDPOINT = "https://text.pollinations.ai/openai"
-POLLINATIONS_MODEL = "openai-fast"  # GPT-OSS 20B, поддерживает вызов инструментов
+POLLINATIONS_REFERRER = "smm-lead-bot"
+# Порядок важен: пробуем по очереди, пока какая-нибудь модель не ответит.
+# Без referrer у бесплатного режима сразу кончается квота анонимного ключа.
+POLLINATIONS_MODELS = ["openai", "openai-fast", "mistral"]
+POLLINATIONS_MODEL = POLLINATIONS_MODELS[0]  # совместимость с прежним именем
+
+
+class PollinationsLLM(BaseLLM):
+    """Бесплатный режим без ключа.
+
+    Два неочевидных момента, оба проверены на живом сервисе:
+      * запрос без referrer отбивается сообщением "reached its budget",
+        причём с HTTP 200 — поэтому отказ распознаём по тексту, а не по статусу;
+      * не все модели умеют вызывать инструменты, поэтому перебираем список.
+    """
+
+    def __init__(self, models: list[str], timeout: int = 90) -> None:
+        self.models = models
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.endpoint = f"{POLLINATIONS_ENDPOINT}?referrer={POLLINATIONS_REFERRER}"
+
+    @staticmethod
+    def _is_quota_refusal(reply: LLMReply) -> bool:
+        low = reply.text.lower()
+        return not reply.tool_calls and ("budget" in low or "rate limit" in low)
+
+    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> LLMReply:
+        last: LLMReply | None = None
+        errors: list[str] = []
+        for model in self.models:
+            client = OpenAICompatibleLLM("", POLLINATIONS_ENDPOINT, model,
+                                         timeout=self.timeout, endpoint=self.endpoint)
+            try:
+                reply = client.chat(messages, tools)
+            except LLMError as exc:
+                errors.append(f"{model}: {exc}")
+                continue
+            if reply.tool_calls or not self._is_quota_refusal(reply):
+                return reply
+            last = reply
+            errors.append(f"{model}: отказ по квоте")
+        if last is not None:
+            return last
+        raise LLMError("Бесплатная модель недоступна: " + "; ".join(errors))
 
 
 def build_llm() -> BaseLLM:
@@ -180,9 +224,9 @@ def build_llm() -> BaseLLM:
 
     # бесплатный режим: ключ не нужен вообще
     if provider == "pollinations":
-        return OpenAICompatibleLLM("", POLLINATIONS_ENDPOINT,
-                                   settings.llm_model or POLLINATIONS_MODEL,
-                                   endpoint=POLLINATIONS_ENDPOINT)
+        if settings.llm_model:
+            return PollinationsLLM([settings.llm_model] + POLLINATIONS_MODELS)
+        return PollinationsLLM(POLLINATIONS_MODELS)
 
     if provider == "none" or not settings.llm_api_key:
         return NoLLM()
