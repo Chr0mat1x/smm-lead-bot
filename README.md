@@ -174,6 +174,12 @@ smm_bot/
 scripts/
   get_user_id.py       узнать свой Telegram ID
   llm_smoke.py         проверка разбора ответов LLM на локальном сервере
+  free_llm_demo.py     живая проверка агента с бесплатной нейросетью
+deploy/
+  install.sh           установка на VPS одной командой
+  push_to_github.sh    заливка в GitHub с проверкой секретов
+  smm-bot.service      systemd-юнит с автозапуском
+  README.md            гид по деплою
 tests/
   test_core.py         тесты ядра
   test_agent.py        тесты диалога (LLM подменяется фейком)

@@ -24,6 +24,17 @@
 
 ---
 
+## Шаг 0. Залить код на GitHub
+
+Render и Railway разворачивают из GitHub. Создайте **пустой** репозиторий
+на https://github.com/new (без README и .gitignore), затем выполните:
+
+```bash
+bash deploy/push_to_github.sh smm-lead-bot
+```
+
+Скрипт сам проверит, что `.env` и токены не уйдут в git, и зальёт проект.
+
 ## Вариант 1. Render (просто, есть бесплатный тариф)
 
 1. Залейте проект на GitHub.
