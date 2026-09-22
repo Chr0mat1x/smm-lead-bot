@@ -1,0 +1,22 @@
+[Unit]
+Description=SMM lead bot (Telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/smm_bot
+# .env лежит рядом и читается через python-dotenv
+ExecStart=/opt/smm_bot/.venv/bin/python -m smm_bot.bot
+Restart=always
+RestartSec=5
+# логи: journalctl -u smm-bot -f
+StandardOutput=journal
+StandardError=journal
+
+# базовая защита
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

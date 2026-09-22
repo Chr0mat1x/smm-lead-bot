@@ -7,3 +7,5 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 leads_export.csv
+.venv/
+*.log

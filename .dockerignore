@@ -1,0 +1,12 @@
+.git
+.gitignore
+.env
+data
+tests
+__pycache__
+*.pyc
+.pytest_cache
+*.sqlite3
+*.session
+*.md
+.DS_Store

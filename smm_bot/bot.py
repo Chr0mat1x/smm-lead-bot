@@ -20,6 +20,7 @@ from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton,
 
 from .agent import Agent
 from .config import settings
+from .health import start_health_server
 from .llm import build_llm
 from .models import Channel, Lead, LeadStatus
 from .pipeline import export_leads_csv, prepare_messages, run_discovery
@@ -349,6 +350,9 @@ async def main() -> None:
     settings.validate_bot()
     if not settings.allowed_user_ids:
         log.warning("ALLOWED_USER_IDS не задан: бот ответит любому, кто его найдёт.")
+    # на хостингах вроде Render нужен открытый порт, иначе сервис считают упавшим
+    if settings.port:
+        start_health_server(storage, settings.port)
     bot = Bot(token=settings.telegram_bot_token)
     await dp.start_polling(bot)
 

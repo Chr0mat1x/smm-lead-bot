@@ -51,6 +51,9 @@ class Settings:
     llm_model: str = os.getenv("LLM_MODEL", "")
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.7") or 0.7)
 
+    # порт для health-сервера (нужен на хостингах, которые ждут открытый порт)
+    port: int = _int(os.getenv("PORT"), 0)
+
     allowed_user_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:

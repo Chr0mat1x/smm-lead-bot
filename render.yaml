@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: smm-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m smm_bot.bot
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      # остальные переменные (TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS и т.д.)
+      # задайте в панели Render: Environment -> Add Environment Variable
+      - key: LLM_PROVIDER
+        value: pollinations
