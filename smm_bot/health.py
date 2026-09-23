@@ -28,7 +28,7 @@ def _version() -> str:
     return (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "dev")[:7]
 
 
-def _make_handler(storage) -> type[BaseHTTPRequestHandler]:
+def _make_handler(storage, stats=None) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args) -> None:
             pass  # не засоряем логи запросами мониторинга
@@ -42,6 +42,8 @@ def _make_handler(storage) -> type[BaseHTTPRequestHandler]:
                         "leads": storage.total(),
                         "sent_today": storage.sent_today(),
                     }
+                    if stats:
+                        payload.update(stats())
                     body = json.dumps(payload, ensure_ascii=False).encode()
                     code = 200
                 except Exception as exc:  # noqa: BLE001 — база недоступна, честно говорим об этом
@@ -61,9 +63,9 @@ def _make_handler(storage) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-def start_health_server(storage, port: int) -> HTTPServer:
+def start_health_server(storage, port: int, stats=None) -> HTTPServer:
     """Поднимает сервер в фоновом потоке и возвращает его."""
-    server = HTTPServer(("0.0.0.0", port), _make_handler(storage))
+    server = HTTPServer(("0.0.0.0", port), _make_handler(storage, stats))
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="health")
     thread.start()
     log.info("Health-сервер слушает порт %s (GET /health)", port)

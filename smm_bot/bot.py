@@ -13,6 +13,7 @@ import html
 import logging
 import os
 import re
+import time
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -39,6 +40,30 @@ AGENT_TIMEOUT = 120
 
 storage = Storage(settings.db_path)
 dp = Dispatcher()
+
+# Состояние процесса наружу — через /health. На Render нет доступа к логам,
+# поэтому «бот жив, но не отвечает» должен быть виден снаружи.
+runtime_stats = {"handled": 0, "errors": 0, "last_update": "", "last_error": "",
+                 "started_at": time.time()}
+
+
+def stats_payload() -> dict:
+    """Показатели процесса для /health.
+
+    uptime отличает стабильный процесс от перезапускающегося: если он сбрасывается
+    при каждом опросе, хостинг убивает бота, и «не отвечает» — про это.
+    """
+    return {**runtime_stats, "uptime_sec": int(time.time() - runtime_stats["started_at"])}
+
+
+@dp.update.outer_middleware()
+async def count_updates(handler, event, data):
+    """Считаем дошедшие обновления: видно, получает ли бот сообщения вообще."""
+    runtime_stats["handled"] += 1
+    runtime_stats["last_update"] = type(event.event).__name__
+    return await handler(event, data)
+
+
 
 CATEGORY_LABELS = {
     "cafe": "Кафе", "restaurant": "Рестораны", "fast_food": "Фастфуд", "bar": "Бары",
@@ -442,6 +467,9 @@ async def on_error(event: ErrorEvent) -> None:
     на хостинге логов не видит и делает вывод «бот ничего не отвечает».
     """
     log.exception("Ошибка в обработчике", exc_info=event.exception)
+    runtime_stats["errors"] += 1
+    runtime_stats["last_error"] = (str(event.exception)[:200]
+                                   or event.exception.__class__.__name__)
     update = event.update
     message = getattr(update, "message", None)
     if message is None:
@@ -481,9 +509,10 @@ async def main() -> None:
         log.warning("ALLOWED_USER_IDS не задан: бот ответит любому, кто его найдёт.")
     # на хостингах вроде Render нужен открытый порт, иначе сервис считают упавшим
     if settings.port:
-        start_health_server(storage, settings.port)
+        start_health_server(storage, settings.port, stats_payload)
+    await _log_startup()
     bot = Bot(token=settings.telegram_bot_token)
-    await dp.start_polling(bot, on_startup=[_log_startup])
+    await dp.start_polling(bot)
 
 
 async def _log_startup() -> None:
