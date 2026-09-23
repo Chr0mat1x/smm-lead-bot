@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -74,33 +75,48 @@ class OpenAICompatibleLLM(BaseLLM):
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        # без лимита бесплатные модели иногда думают по минуте — обрезаем
+        payload["max_tokens"] = 1200
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        try:
-            resp = self.session.post(self.endpoint, headers=headers, json=payload,
-                                     timeout=self.timeout)
-        except requests.RequestException as exc:
-            raise LLMError(f"LLM недоступен: {exc}") from exc
 
-        if resp.status_code != 200:
-            raise LLMError(f"LLM вернул HTTP {resp.status_code}: {resp.text[:300]}")
-
-        data = resp.json()
-        try:
-            message = data["choices"][0]["message"]
-        except (KeyError, IndexError) as exc:
-            raise LLMError(f"Неожиданный ответ LLM: {str(data)[:300]}") from exc
-
-        calls: list[ToolCall] = []
-        for raw in message.get("tool_calls") or []:
-            fn = raw.get("function") or {}
+        # бесплатный сервис регулярно отдаёт 5xx и обрывы — без повторов
+        # пользователь видит «работаю без нейросети» на ровном месте
+        last_exc: Exception | None = None
+        for attempt in range(3):
             try:
-                args = json.loads(fn.get("arguments") or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            calls.append(ToolCall(id=raw.get("id", ""), name=fn.get("name", ""), arguments=args))
-        return LLMReply(text=message.get("content") or "", tool_calls=calls)
+                resp = self.session.post(self.endpoint, headers=headers, json=payload,
+                                         timeout=self.timeout)
+            except requests.RequestException as exc:
+                last_exc = LLMError(f"LLM недоступен: {exc}")
+                time.sleep(0.8 * (attempt + 1))
+                continue
+
+            if resp.status_code >= 500:
+                last_exc = LLMError(f"LLM вернул HTTP {resp.status_code}: {resp.text[:200]}")
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            if resp.status_code != 200:
+                raise LLMError(f"LLM вернул HTTP {resp.status_code}: {resp.text[:300]}")
+
+            data = resp.json()
+            try:
+                message = data["choices"][0]["message"]
+            except (KeyError, IndexError) as exc:
+                raise LLMError(f"Неожиданный ответ LLM: {str(data)[:300]}") from exc
+
+            calls: list[ToolCall] = []
+            for raw in message.get("tool_calls") or []:
+                fn = raw.get("function") or {}
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                calls.append(ToolCall(id=raw.get("id", ""), name=fn.get("name", ""), arguments=args))
+            return LLMReply(text=message.get("content") or "", tool_calls=calls)
+
+        raise last_exc or LLMError("LLM недоступен")
 
 
 class AnthropicLLM(BaseLLM):
@@ -189,7 +205,7 @@ class PollinationsLLM(BaseLLM):
       * не все модели умеют вызывать инструменты, поэтому перебираем список.
     """
 
-    def __init__(self, models: list[str], timeout: int = 90) -> None:
+    def __init__(self, models: list[str], timeout: int = 35) -> None:
         self.models = models
         self.timeout = timeout
         self.session = requests.Session()

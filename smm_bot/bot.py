@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -23,12 +24,17 @@ from .config import settings
 from .health import start_health_server
 from .llm import build_llm
 from .models import Channel, Lead, LeadStatus
+from .osm import category_tag_values
 from .pipeline import export_leads_csv, prepare_messages, run_discovery
 from .scoring import CATEGORY_WEIGHT
 from .storage import Storage
+from .tools import category_label
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("smm_bot")
+
+# сколько ждём ответ нейросети, прежде чем сказать «не дождался»
+AGENT_TIMEOUT = 120
 
 storage = Storage(settings.db_path)
 dp = Dispatcher()
@@ -90,6 +96,10 @@ current_batch: dict[int, list[Lead]] = {}
 # чаты, которые сейчас ждут от нас название города
 pending_city: set[int] = set()
 
+# какие категории искали последними: «Следующие лиды» не должны подмешивать
+# кафе к баням, если поиск был по баням
+active_categories: dict[int, list[str]] = {}
+
 # город последнего поиска: «Следующие лиды» должны добирать тот же город,
 # а не подмешивать старые лиды из других городов
 active_city: dict[int, str] = {}
@@ -114,7 +124,7 @@ def format_lead(lead: Lead, position: str = "") -> str:
         contact_lines.append("⚠️ Контактов нет — только адрес, нужен ручной поиск")
 
     location = ", ".join(x for x in [lead.city, lead.address] if x) or "адрес не указан"
-    category = CATEGORY_LABELS.get(lead.category, lead.category or "—")
+    category = category_label(lead.category)
 
     esc = html.escape
     contacts = esc("\n".join(contact_lines))
@@ -200,6 +210,7 @@ async def do_discovery(message: Message, place: str) -> None:
     # stats.city — каноническое название от геокодера: показываем «Саратов»,
     # а не «Саратове», и по нему же фильтруем выдачу
     active_city[message.chat.id] = stats.city or place
+    active_categories[message.chat.id] = category_tag_values(cats)
     # Новый поиск по городу начинаем с лучших лидов, а не с того места,
     # где остановились в прошлый раз.
     storage.reset_shown_for_city(active_city[message.chat.id])
@@ -243,7 +254,9 @@ async def show_next_leads(message: Message, place: str | None = None, batch_size
         return
 
     def pick(unseen: bool) -> list[Lead]:
-        return [l for l in storage.find_by_city(city, status=LeadStatus.NEW, unseen_only=unseen)
+        return [l for l in storage.find_by_city(
+                    city, status=LeadStatus.NEW, unseen_only=unseen,
+                    categories=active_categories.get(message.chat.id) or None)
                 if l.reachable][:batch_size]
 
     # Сначала только непоказанные. Если в городе новых не осталось — берём
@@ -349,18 +362,52 @@ async def talk_to_agent(message: Message, text: str) -> None:
         context_lead_key = storage.lead_key_for_message(message.chat.id, replied.message_id)
 
     note = await message.answer("Думаю…")
-    try:
-        answer = await asyncio.to_thread(agent.respond, message.chat.id, text, context_lead_key)
-    except Exception as exc:  # noqa: BLE001 — показываем причину, не роняем бота
-        log.exception("agent failed")
-        await note.edit_text(f"Не получилось ответить: {exc}")
+    chat_id = message.chat.id
+    task = asyncio.create_task(
+        asyncio.to_thread(agent.respond, chat_id, text, context_lead_key)
+    )
+
+    # Бесплатная модель иногда зависает. Не заставляем человека ждать вслепую:
+    # каждые 15 секунд обновляем статус, а после 120 секунд отвечаем честно.
+    waited = 0
+    while waited < AGENT_TIMEOUT:
+        try:
+            answer = await asyncio.wait_for(asyncio.shield(task), timeout=15)
+            break
+        except asyncio.TimeoutError:
+            waited += 15
+            await note.edit_text(f"Думаю… уже {waited} секунд. Нейросеть отвечает медленно.")
+    else:
+        await note.edit_text(
+            "Нейросеть не ответила за 2 минуты — видимо, сервис перегружен.\n\n"
+            "Пока могу работать по командам: «найди в Саратове», «покажи следующие», "
+            "«статистика». Или напишите ещё раз через минуту."
+        )
         return
+
     await note.edit_text(render_answer(answer))
 
 
 def render_answer(text: str) -> str:
-    """Ответ ассистента может содержать что угодно — экранируем и режем длину."""
-    safe = html.escape(text)
+    """Ответ ассистента может содержать что угодно — чистим markdown и режем длину."""
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        # строки-разделители таблиц («|---|---|») и сами таблицы в Telegram
+        # выглядят мусором: палки, звёздочки, обратные кавычки
+        if re.fullmatch(r"\|?[\s|:\-]+\|?", stripped) and "|" in stripped:
+            continue
+        if stripped.startswith("|") and stripped.endswith("|"):
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            line = " — ".join(c for c in cells if c)
+        line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
+        line = re.sub(r"(?<!\w)\*(.+?)\*(?!\w)", r"\1", line)
+        line = line.replace("`", "")
+        lines.append(line)
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    safe = html.escape(cleaned)
     if len(safe) > 3800:
         safe = safe[:3800] + "…"
     return safe

@@ -15,8 +15,32 @@ from typing import Any
 from .config import settings
 from .message_generator import generate_message
 from .models import Lead, LeadStatus
-from .scoring import CATEGORY_WEIGHT
+from . import osm
 from .storage import Storage
+
+# те же подписи, что в кнопках бота: в выдаче не должно быть английского "sauna"
+CATEGORY_LABELS = {
+    "cafe": "Кафе", "restaurant": "Ресторан", "fast_food": "Фастфуд", "bar": "Бар",
+    "bakery": "Пекарня", "banya": "Баня/сауна", "barber": "Парикмахерская",
+    "beauty": "Салон красоты", "gym": "Фитнес", "car_service": "Автосервис",
+    "laundry": "Химчистка", "florist": "Цветочный", "pet": "Зооуслуги",
+    "auto_wash": "Автомойка", "diy": "Строймагазин",
+}
+
+
+def category_label(value: str | None) -> str:
+    """Подпись категории для выдачи.
+
+    В базе категория — это значение тега OSM ("sauna", "hairdresser"),
+    поэтому сначала смотрим прямые подписи, потом переводим через синонимы.
+    """
+    if not value:
+        return "без категории"
+    if value in CATEGORY_LABELS:
+        return CATEGORY_LABELS[value]
+    preset = osm.CATEGORY_ALIASES.get(value)
+
+    return CATEGORY_LABELS.get(preset or "", value)
 
 # JSON-схемы для LLM (формат OpenAI tools, для Anthropic конвертируем в llm.py)
 TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -32,8 +56,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "city": {"type": "string", "description": "Город, например Тюмень"},
                     "categories": {
                         "type": "array",
-                        "items": {"type": "string", "enum": sorted(CATEGORY_WEIGHT.keys())},
-                        "description": "Какие категории искать. Пусто = стандартный набор.",
+                        # именно ключи пресетов: раньше здесь были значения тегов
+                        # OSM (sauna, hairdresser), и поиск падал на них
+                        "items": {"type": "string", "enum": sorted(osm.CATEGORY_PRESETS)},
+                        "description": "Какие категории искать. Пусто = стандартный набор. "
+                                       "Бери ключи из списка: banya — это бани и сауны.",
                     },
                 },
                 "required": ["city"],
@@ -177,6 +204,8 @@ class ToolBox:
         self.last_shown: list[str] = []
         # город последнего поиска: поиск по Саратову не должен показывать Питер
         self.active_city: str = ""
+        # категории последнего поиска: в выдаче «бани» не должно быть кафе
+        self.active_categories: list[str] = []
 
     def schemas(self) -> list[dict[str, Any]]:
         return TOOL_SCHEMAS
@@ -201,11 +230,13 @@ class ToolBox:
         categories = args.get("categories") or None
         stats = run_discovery(self.storage, city, categories)
         self.active_city = stats.city or city
+        self.active_categories = osm.category_tag_values(categories)
         self.storage.reset_shown_for_city(self.active_city)
 
         def pick(unseen: bool) -> list[Lead]:
-            return [l for l in self.storage.find_by_city(self.active_city, status=LeadStatus.NEW,
-                                                         unseen_only=unseen)
+            return [l for l in self.storage.find_by_city(
+                        self.active_city, status=LeadStatus.NEW, unseen_only=unseen,
+                        categories=self.active_categories or None)
                     if l.reachable][:10]
 
         leads = pick(unseen=True)
@@ -215,9 +246,26 @@ class ToolBox:
             self.storage.mark_shown([l.key for l in leads])
         self.last_shown = [l.key for l in leads]
         city_label = leads[0].city if leads else self.active_city
+        # Лиды кладём прямо в результат: иначе модель делает лишний круг
+        # «tool -> show_leads -> tool -> ответ» и в сумме отвечает по минуте.
+        if leads:
+            # больше пяти не отдаём: модель честно переписывает весь список,
+            # и ответ растёт до минуты
+            head = leads[:5]
+            lines = [f"{i+1}. {l.name} — {category_label(l.category)}, "
+                     f"{l.city or 'адрес неизвестен'}"
+                     f" | {l.phone or l.email or l.instagram or l.telegram or 'контакта нет'}"
+                     f" | скор {l.score} | ключ {l.key}"
+                     for i, l in enumerate(head)]
+            listing = "\n\nЛиды по приоритету:\n" + "\n".join(lines)
+            if len(leads) > len(head):
+                listing += f"\n...и ещё {len(leads) - len(head)}. Остальные — по кнопке «Следующие лиды»."
+        else:
+            listing = ("\n\nПодходящих лидов в этом городе не нашлось. "
+                       "Предложите другой город или другую категорию.")
         return {
             "ok": True,
-            "result": f"По городу {city_label}: {stats.as_text()}",
+            "result": f"По городу {city_label}: {stats.as_text()}{listing}",
             "data": {"stats": stats.__dict__, "shown_keys": self.last_shown},
         }
 
@@ -229,14 +277,17 @@ class ToolBox:
             status = LeadStatus.NEW
         limit = int(args.get("limit") or 5)
         # Если недавно был поиск по городу — показываем из него, а не всю базу.
+        # Категории тоже держим: после «найди бани» не должно быть кафе.
         leads = [l for l in self.storage.list_leads(status=status, limit=limit,
-                                                    city=self.active_city or None)
+                                                    city=self.active_city or None,
+                                                    categories=self.active_categories or None)
                  if l.reachable]
         self.last_shown = [l.key for l in leads]
         if not leads:
             where = f" по городу {self.active_city}" if self.active_city else ""
             return {"ok": True, "result": f"Лидов со статусом {status.value}{where} нет."}
-        lines = [f"{i+1}. {l.name} ({l.category}, {l.city}) — скор {l.score}, ключ {l.key}"
+        lines = [f"{i+1}. {l.name} ({category_label(l.category)}, {l.city}) — "
+                 f"скор {l.score}, ключ {l.key}"
                  for i, l in enumerate(leads)]
         return {"ok": True, "result": "Найдены лиды:\n" + "\n".join(lines),
                 "data": {"shown_keys": self.last_shown}}
@@ -322,7 +373,7 @@ class ToolBox:
 
 def _describe(lead: Lead) -> str:
     parts = [
-        f"{lead.name} ({lead.category}, {lead.city})",
+        f"{lead.name} ({category_label(lead.category)}, {lead.city})",
         f"ключ: {lead.key}",
         f"статус: {lead.status.value}, скор: {lead.score}, канал: {lead.best_channel.value}",
     ]

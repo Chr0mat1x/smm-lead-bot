@@ -61,6 +61,71 @@ CATEGORY_PRESETS: dict[str, list[tuple[str, str]]] = {
 
 DEFAULT_CATEGORIES = ["cafe", "banya", "barber", "beauty", "bakery", "auto_wash", "car_service"]
 
+# Словарь синонимов: и значения тегов OSM, и русские слова владельца.
+# Без него «найди бани» ломалось: нейросеть видела в схеме инструмента
+# значение тега "sauna", а поиск знает только ключ пресета "banya".
+CATEGORY_ALIASES: dict[str, str] = {
+    # значения тегов OSM -> ключ пресета
+    "sauna": "banya", "spa": "banya",
+    "hairdresser": "barber",
+    "massage": "beauty",
+    "fitness_centre": "gym", "sports_centre": "gym", "gym": "gym",
+    "car_repair": "car_service", "tyres": "car_service",
+    "dry_cleaning": "laundry",
+    "car_wash": "auto_wash",
+    "doityourself": "diy", "hardware": "diy",
+    "pet_grooming": "pet",
+    "pub": "bar",
+    # русские слова
+    "баня": "banya", "бани": "banya", "банный": "banya", "сауна": "banya", "спа": "banya",
+    "кафе": "cafe", "кофейня": "cafe", "кофе": "cafe", "кофейни": "cafe",
+    "барбершоп": "barber", "парикмахерская": "barber", "стрижка": "barber",
+    "салон": "beauty", "красота": "beauty", "массаж": "beauty",
+    "автомойка": "auto_wash", "мойка": "auto_wash",
+    "автосервис": "car_service", "шиномонтаж": "car_service", "сто": "car_service",
+    "пекарня": "bakery", "хлеб": "bakery",
+    "прачечная": "laundry", "химчистка": "laundry",
+    "цветы": "florist", "цветочный": "florist",
+    "зоомагазин": "pet", "груминг": "pet",
+    "фитнес": "gym", "спортзал": "gym",
+    "ресторан": "restaurant",
+    "бар": "bar", "паб": "bar",
+    "стройматериалы": "diy",
+}
+
+
+def normalize_categories(categories: list[str] | str | None) -> list[str]:
+    """Приводим категории к ключам CATEGORY_PRESETS, отбрасывая мусор."""
+    if categories is None:
+        return []
+    if isinstance(categories, str):
+        categories = categories.split(",")
+    result: list[str] = []
+    for raw in categories:
+        name = str(raw).strip().lower()
+        if not name:
+            continue
+        key = name if name in CATEGORY_PRESETS else CATEGORY_ALIASES.get(name)
+        if key and key not in result:
+            result.append(key)
+    return result
+
+
+def category_tag_values(categories: list[str] | str | None) -> list[str]:
+    """Значения тегов OSM для категорий — их и хранит база.
+
+    «Баня» в базе лежит как «sauna» или «spa», поэтому фильтровать по ключу
+    пресета нельзя: вернём и сами теги, и ключ на случай старых записей.
+    """
+    values: list[str] = []
+    for cat in normalize_categories(categories):
+        if cat not in values:
+            values.append(cat)
+        for _, tag_value in CATEGORY_PRESETS.get(cat, []):
+            if tag_value not in values:
+                values.append(tag_value)
+    return values
+
 
 @dataclass
 class GeoArea:
@@ -220,16 +285,18 @@ def build_query(area: GeoArea, categories: list[str] | str) -> str:
     """Overpass QL: собираем запрос по всем выбранным категориям.
 
     Категории нормализуем: нейросеть в вызове инструмента может передать как
-    список, так и одну строку ("cafe"), а иногда строку через запятую.
+    список, так и одну строку ("cafe"), а иногда строку через запятую. Ещё она
+    любит значения тегов OSM ("sauna") вместо ключей пресетов ("banya") —
+    поэтому неизвестное имя не роняем, а переводим через синонимы.
     """
-    if isinstance(categories, str):
-        categories = [c.strip() for c in categories.split(",") if c.strip()]
+    cats = normalize_categories(categories)
     parts: list[str] = []
-    for cat in categories:
+    for cat in cats:
         for tag_key, tag_value in CATEGORY_PRESETS.get(cat, []):
             parts.append(f'  nwr["{tag_key}"="{tag_value}"]({area.as_overpass()});')
     if not parts:
-        raise ValueError("Пустой список категорий")
+        raise ValueError("Не понял категории. Доступные: "
+                         + ", ".join(sorted(CATEGORY_PRESETS)))
     return "[out:json][timeout:60];\n(\n" + "\n".join(parts) + "\n);\nout center tags;"
 
 

@@ -165,8 +165,8 @@ def test_categories_may_arrive_as_string():
     assert "cafe" in comma and "hairdresser" in comma
 
 
-def _lead(key: str, city: str, score: int = 50) -> Lead:
-    return Lead(source="osm", source_id=key, name=f"Точка {key}", category="cafe",
+def _lead(key: str, city: str, score: int = 50, category: str = "cafe") -> Lead:
+    return Lead(source="osm", source_id=key, name=f"Точка {key}", category=category,
                 city=city, phone="+7 900 000-00-00", score=score)
 
 
@@ -206,3 +206,182 @@ def test_shown_leads_are_not_repeated(tmp_path) -> None:
     storage.reset_shown_for_city("Саратов")
     again = storage.find_by_city("Саратов", status=LeadStatus.NEW, unseen_only=True)
     assert len(again) == 3
+
+
+def test_category_filter_excludes_other_categories(tmp_path) -> None:
+    """После поиска «бани» в выдаче были кафе: фильтра категорий не было."""
+    from smm_bot.osm import category_tag_values
+    from smm_bot.storage import Storage
+
+    storage = Storage(tmp_path / "t.sqlite3")
+    storage.upsert_lead(_lead("sar/banya", "Саратов", score=86, category="sauna"))
+    storage.upsert_lead(_lead("sar/cafe", "Саратов", score=85, category="cafe"))
+
+    values = category_tag_values("banya")
+    assert "sauna" in values and "cafe" not in values
+
+    found = storage.find_by_city("Саратов", status=LeadStatus.NEW, categories=values)
+    assert [l.name for l in found if l.category == "cafe"] == []
+    assert any(l.category == "sauna" for l in found)
+
+    # без фильтра кафе видно — значит дело именно в фильтре
+    assert len(storage.find_by_city("Саратов", status=LeadStatus.NEW)) == 2
+
+
+def test_search_accepts_osm_tag_values():
+    """Нейросеть передаёт значения тегов OSM ("sauna"), а не ключи пресетов.
+    Раньше поиск на этом падал — пользователь видел «фигню»."""
+    from smm_bot.osm import GeoArea, build_query, normalize_categories
+
+    for name in ["sauna", "spa", "баня", "бани", "banya", "БАНЯ"]:
+        assert normalize_categories(name) == ["banya"], name
+
+    # смешанный ввод и мусор
+    assert normalize_categories(["cafe", "hairdresser", "чепуха"]) == ["cafe", "barber"]
+
+    area = GeoArea(query="Саратов", bbox=(51.4, 45.8, 51.7, 46.2), name="Саратов")
+    query = build_query(area, ["sauna"])
+    assert 'leisure"="sauna' in query
+
+    try:
+        build_query(area, ["чепуха"])
+    except ValueError as exc:
+        assert "Доступные" in str(exc)
+    else:
+        raise AssertionError("ожидали понятную ошибку про категории")
+
+
+def test_category_label_translates_osm_values():
+    """В базе категория — тег OSM, в интерфейсе должно быть по-русски."""
+    from smm_bot.tools import category_label
+
+    assert category_label("sauna") == "Баня/сауна"
+    assert category_label("hairdresser") == "Парикмахерская"
+    assert category_label("cafe") == "Кафе"
+    assert category_label(None) == "без категории"
+    assert category_label("unknown_tag") == "unknown_tag"
+
+
+def test_agent_reports_tool_failure_instead_of_fake_success():
+    """Модель писала «Готово», хотя tool вернул ok=False."""
+    from smm_bot.agent import Agent
+    from smm_bot.llm import BaseLLM, LLMReply, ToolCall
+
+    class LLM(BaseLLM):
+        def __init__(self):
+            self.step = 0
+
+        def chat(self, messages, tools=None):
+            self.step += 1
+            if self.step == 1:
+                return LLMReply(text="", tool_calls=[
+                    ToolCall(id="1", name="search_leads", arguments={"city": "Саратов"})])
+            return LLMReply(text="Готово. Проверьте базу.")
+
+    class Storage:
+        def get_dialogue(self, *a, **kw):
+            return []
+
+        def add_dialogue(self, *a, **kw):
+            return None
+
+    class ToolBox:
+        def schemas(self):
+            return []
+
+        def run(self, name, args):
+            return {"ok": False, "result": "Не понял категории"}
+
+        active_city = ""
+
+    agent = Agent(Storage(), LLM())
+    agent.toolbox = ToolBox()
+    answer = agent._run_llm(1)
+    assert "Не получилось выполнить поиск" in answer
+    assert "Проверьте базу" not in answer
+
+
+def test_llm_client_retries_on_server_error():
+    """Бесплатный сервис отдаёт 5xx на ровном месте — без повторов
+    пользователь видит «работаю без нейросети»."""
+    from smm_bot.llm import LLMError, LLMReply, OpenAICompatibleLLM
+
+    calls = {"n": 0}
+
+    class Resp:
+        def __init__(self, code):
+            self.status_code = code
+            self.text = "upstream error"
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class Session:
+        def post(self, *a, **kw):
+            calls["n"] += 1
+            return Resp(502 if calls["n"] < 3 else 200)
+
+    client = OpenAICompatibleLLM("", "http://x", "m")
+    client.session = Session()
+    reply = client.chat([{"role": "user", "content": "привет"}])
+    assert calls["n"] == 3, "клиент не повторил запрос после 5xx"
+    assert reply.text == "ok"
+
+
+def test_llm_client_gives_up_with_error():
+    """Если сервис лежит совсем, должна быть внятная ошибка, а не зависание."""
+    from smm_bot.llm import LLMError, OpenAICompatibleLLM
+
+    class Resp:
+        status_code = 502
+        text = "bad gateway"
+
+    class Session:
+        def post(self, *a, **kw):
+            return Resp()
+
+    client = OpenAICompatibleLLM("", "http://x", "m")
+    client.session = Session()
+    try:
+        client.chat([{"role": "user", "content": "привет"}])
+    except LLMError as exc:
+        assert "502" in str(exc)
+    else:
+        raise AssertionError("ожидали LLMError после исчерпания повторов")
+
+
+def test_answer_cleanup_removes_markdown_tables():
+    """Нейросеть шлёт markdown-таблицы, в Telegram они выглядят палками."""
+    from smm_bot.bot import render_answer
+
+    raw = "| № | Название |\n|---|---|\n| 1 | **Мука** |\n| 2 | `Феро` |"
+    out = render_answer(raw)
+    assert "|" not in out
+    assert "---" not in out
+    assert "**" not in out
+    assert "`" not in out
+    assert "Мука" in out and "Феро" in out
+
+
+def test_fallback_tells_real_reason():
+    """Раньше бот советовал добавить ключ, хотя бесплатному режиму ключ не нужен."""
+    from smm_bot.agent import Agent
+    from smm_bot.llm import NoLLM
+
+    class Storage:
+        def find_by_city(self, *a, **kw):
+            return []
+
+        def get_dialogue(self, *a, **kw):
+            return []
+
+        def add_dialogue(self, *a, **kw):
+            return None
+
+        def list_leads(self, *a, **kw):
+            return []
+
+    agent = Agent(Storage(), NoLLM())
+    answer = agent._fallback(1, "что нового?", None, reason="LLM вернул HTTP 502")
+    assert "502" in answer
+    assert "LLM_API_KEY" not in answer

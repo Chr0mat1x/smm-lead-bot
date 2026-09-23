@@ -47,11 +47,26 @@ SYSTEM_PROMPT = """Ты — ассистент, который помогает 
 если чего-то не знаешь, вызови инструмент и посмотри. Если владелец пишет
 «второй», «этот», «он» — смотри последнюю выдачу в истории диалога.
 
+Формат ответа: обычный текст, без markdown. Не делай таблиц с «|» — в Telegram
+они превращаются в мусор. Лиды перечисляй строками:
+  1. Название (категория, адрес) — телефон, скор
+Пиши 3-5 лидов за раз, чтобы ответ оставался коротким.
+
 Никогда не обещай массовую рассылку и не предлагай обходить ограничения Telegram."""
 
 
 def build_system_prompt() -> str:
     return SYSTEM_PROMPT.format(your_name=settings.your_name)
+
+
+SUCCESS_WORDS = ("готово", "сделано", "нашёл", "нашел", "найдено", "показываю",
+                 "вот список", "выполнено", "обновил")
+
+
+def _looks_like_success(text: str) -> bool:
+    """Похоже ли, что модель отчитывается об успехе, ничего не сделав."""
+    low = text.lower()
+    return any(word in low for word in SUCCESS_WORDS)
 
 
 class Agent:
@@ -73,6 +88,9 @@ class Agent:
             answer = self._run_llm(chat_id)
         except LLMError as exc:
             log.warning("LLM недоступен, включаю запасной режим: %s", exc)
+            answer = self._fallback(chat_id, user_text, context_lead_key, reason=str(exc))
+        except Exception:  # noqa: BLE001 — инструмент упал, но диалог ронять нельзя
+            log.exception("ошибка при обработке сообщения")
             answer = self._fallback(chat_id, user_text, context_lead_key)
 
         self.storage.add_dialogue(chat_id, "assistant", answer)
@@ -82,12 +100,18 @@ class Agent:
         history = self.storage.get_dialogue(chat_id, limit=MAX_HISTORY)
         messages: list[dict] = [{"role": "system", "content": build_system_prompt()}]
         messages += history
+        failed: list[str] = []
 
         for step in range(MAX_STEPS):
             reply = self.llm.chat(messages, tools=self.toolbox.schemas())
 
             if not reply.wants_tools:
-                return reply.text.strip() or "Не понял, уточните, что сделать."
+                text = reply.text.strip()
+                # Модель иногда пишет «Готово», хотя инструмент только что упал.
+                # Тогда показываем причину сбоя, а не бодрый отчёт.
+                if text and failed and _looks_like_success(text):
+                    return "Не получилось выполнить поиск. " + failed[-1]
+                return text or "Не понял, уточните, что сделать."
 
             # кладём запрос модели на вызов инструментов в историю
             messages.append({
@@ -101,8 +125,14 @@ class Agent:
             })
 
             for call in reply.tool_calls:
-                outcome = self.toolbox.run(call.name, call.arguments)
+                try:
+                    outcome = self.toolbox.run(call.name, call.arguments)
+                except Exception as exc:  # noqa: BLE001 — поиск может упасть по сети
+                    log.exception("инструмент %s упал", call.name)
+                    outcome = {"ok": False, "result": f"Инструмент {call.name} не сработал: {exc}"}
                 log.info("tool %s(%s) -> ok=%s", call.name, call.arguments, outcome.get("ok"))
+                if not outcome.get("ok"):
+                    failed.append(str(outcome.get("result", "инструмент не сработал"))[:200])
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.id,
@@ -123,7 +153,8 @@ class Agent:
     KEYWORDS_STATS = ("стат", "сколько")
     KEYWORDS_DNC = ("не пиши", "не писать", "черный список", "чёрный список")
 
-    def _fallback(self, chat_id: int, user_text: str, context_lead_key: str | None) -> str:
+    def _fallback(self, chat_id: int, user_text: str, context_lead_key: str | None,
+                  reason: str = "") -> str:
         text = user_text.lower()
 
         if context_lead_key and any(k in text for k in self.KEYWORDS_REJECT):
@@ -150,12 +181,25 @@ class Agent:
         if any(k in text for k in self.KEYWORDS_SHOW):
             return self._next_after(context_lead_key) or "Новых подходящих лидов нет."
 
-        return ("Сейчас я работаю без нейросети, поэтому понимаю только простые команды: "
+        if reason:
+            log.warning("причина запасного режима: %s", reason)
+        return ("Нейросеть сейчас не ответила, поэтому понимаю только простые команды: "
                 "«найди в Тюмени», «покажи следующие», «статистика», или ответьте на карточку лида "
-                "«не тот контакт». Чтобы я отвечал свободно, добавьте в .env ключ LLM_API_KEY.")
+                "«не тот контакт».\n\n"
+                f"Для разбора у меня сохранена причина: {reason[:300]}\n\n"
+                "У бесплатного режима (LLM_PROVIDER=pollinations) ключ не нужен — "
+                "проблема на стороне сервиса. Попробуйте написать ещё раз через минуту.")
 
     def _next_after(self, lead_key: str | None) -> str:
-        leads = [l for l in self.storage.list_leads(status=LeadStatus.NEW, limit=3) if l.reachable]
+        city = self.toolbox.active_city
+        if city:
+            leads = [l for l in self.storage.find_by_city(city, status=LeadStatus.NEW,
+                                                          unseen_only=True) if l.reachable][:3]
+            if not leads:
+                return ""
+        else:
+            leads = [l for l in self.storage.list_leads(status=LeadStatus.NEW, limit=3)
+                     if l.reachable]
         if not leads:
             return ""
         lead = leads[0]

@@ -139,12 +139,14 @@ class Storage:
 
     def list_leads(self, status: LeadStatus | None = None, limit: int = 10,
                    order: str = "score DESC, created_at DESC",
-                   city: str | None = None, unseen_only: bool = False) -> list[Lead]:
+                   city: str | None = None, unseen_only: bool = False,
+                   categories: list[str] | str | None = None) -> list[Lead]:
         """Список лидов с фильтрами.
 
         Фильтр city обязателен при показе после поиска: без него всплывают
         старые лиды других городов с более высоким скором, и выглядит это
-        так, будто бот искал в Санкт-Петербурге вместо Саратова.
+        так, будто бот искал в Санкт-Петербурге вместо Саратова. По той же
+        причине нужен фильтр categories — иначе в выдачу «бани» попадали кафе.
         """
         query = "SELECT * FROM leads"
         where: list[str] = []
@@ -155,6 +157,14 @@ class Storage:
         if city:
             where.append("city LIKE ?")
             params.append(f"%{city.strip()}%")
+        if categories:
+            from .osm import category_tag_values  # локальный импорт против цикла
+
+            values = category_tag_values(categories)
+            if values:
+                placeholders = ", ".join("?" for _ in values)
+                where.append(f"category IN ({placeholders})")
+                params.extend(values)
         if unseen_only:
             where.append("(shown_at IS NULL OR shown_at = '')")
         if where:
@@ -166,7 +176,8 @@ class Storage:
         return [_row_to_lead(r) for r in rows]
 
     def find_by_city(self, city: str, status: LeadStatus | None = None,
-                     unseen_only: bool = False) -> list[Lead]:
+                     unseen_only: bool = False,
+                     categories: list[str] | str | None = None) -> list[Lead]:
         """Все лиды города — чтобы «Следующие лиды» не уезжали в другой город.
 
         Город в базе хранится в именительном падеже («Саратов»), а приходит
@@ -176,7 +187,7 @@ class Storage:
 
         for name in name_variants(city):
             found = self.list_leads(status=status, limit=10000, city=name,
-                                    unseen_only=unseen_only)
+                                    unseen_only=unseen_only, categories=categories)
             if found:
                 return found
         return []
