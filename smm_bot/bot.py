@@ -11,11 +11,12 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
 import re
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton,
+from aiogram.types import (CallbackQuery, ErrorEvent, FSInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, KeyboardButton, Message,
                            ReplyKeyboardMarkup)
 
@@ -57,6 +58,27 @@ def is_allowed(message_or_call) -> bool:
         return True  # список не задан — бот открыт только тому, у кого есть токен
     user = getattr(message_or_call, "from_user", None)
     return bool(user and user.id in settings.allowed_user_ids)
+
+
+async def guard(message) -> bool:
+    """Проверка доступа, которая объясняет отказ.
+
+    Молчаливый `return` уже стоил часа диагностики: «бот не отвечает», а
+    причины не видно. Поэтому показываем собеседнику его собственный ID —
+    это единственное, что нужно, чтобы починить ALLOWED_USER_IDS.
+    """
+    if is_allowed(message):
+        return True
+    user = getattr(message, "from_user", None)
+    uid = user.id if user else "неизвестен"
+    log.warning("Отклонил доступ: id=%s username=@%s (ALLOWED_USER_IDS=%s)",
+                uid, getattr(user, "username", None), settings.allowed_user_ids)
+    await message.answer(
+        f"Бот приватный.\n\nВаш Telegram ID: <code>{uid}</code>\n"
+        "Добавьте его в переменную ALLOWED_USER_IDS на хостинге (через запятую, "
+        "если не один) и напишите снова."
+    )
+    return False
 
 
 def main_menu() -> ReplyKeyboardMarkup:
@@ -144,8 +166,7 @@ async def cmd_start(message: Message) -> None:
     if user:
         log.info("Кто-то запустил бота: id=%s username=@%s name=%s",
                  user.id, user.username, user.full_name)
-    if not is_allowed(message):
-        await message.answer("Бот приватный.")
+    if not await guard(message):
         return
     await message.answer(
         "Привет! Я ищу малые бизнесы без сайта и готовлю персональные сообщения.\n\n"
@@ -175,7 +196,7 @@ async def cmd_help(message: Message) -> None:
 
 @dp.message(F.text == "🗂 Категории")
 async def choose_categories(message: Message) -> None:
-    if not is_allowed(message):
+    if not await guard(message):
         return
     await message.answer("Что искать? Отметьте категории:", reply_markup=categories_menu(message.chat.id))
 
@@ -220,7 +241,7 @@ async def do_discovery(message: Message, place: str) -> None:
 
 @dp.message(F.text == "🔍 Найти клиентов")
 async def find_clients(message: Message) -> None:
-    if not is_allowed(message):
+    if not await guard(message):
         return
     pending_city.add(message.chat.id)
     await message.answer("Напишите город, например: Тюмень или Тюмень, Центральный район")
@@ -228,7 +249,7 @@ async def find_clients(message: Message) -> None:
 
 @dp.message(Command("find"))
 async def find_cmd(message: Message) -> None:
-    if not is_allowed(message):
+    if not await guard(message):
         return
     place = message.text.removeprefix("/find").strip()
     if not place:
@@ -317,7 +338,7 @@ async def handle_lead_action(call: CallbackQuery) -> None:
 
 @dp.message(F.text == "📊 Статистика")
 async def stats_button(message: Message) -> None:
-    if not is_allowed(message):
+    if not await guard(message):
         return
     counts = storage.counts_by_status()
     lines = [f"Всего лидов: {storage.total()}", f"Отправлено сегодня: {storage.sent_today()}"]
@@ -328,7 +349,7 @@ async def stats_button(message: Message) -> None:
 
 @dp.message(F.text == "📤 Экспорт CSV")
 async def export_button(message: Message) -> None:
-    if not is_allowed(message):
+    if not await guard(message):
         return
     path = settings.db_path.parent / "leads_export.csv"
     export_leads_csv(storage, str(path))
@@ -338,7 +359,7 @@ async def export_button(message: Message) -> None:
 @dp.message(Command("ask"))
 async def ask_cmd(message: Message) -> None:
     """Явно поговорить с ассистентом."""
-    if not is_allowed(message):
+    if not await guard(message):
         return
     question = message.text.removeprefix("/ask").strip()
     await talk_to_agent(message, question or "Что сейчас в базе?")
@@ -347,7 +368,7 @@ async def ask_cmd(message: Message) -> None:
 @dp.message(Command("reset"))
 async def reset_cmd(message: Message) -> None:
     """Забыть историю диалога."""
-    if not is_allowed(message):
+    if not await guard(message):
         return
     removed = storage.clear_dialogue(message.chat.id)
     agent.toolbox.last_shown = []
@@ -413,10 +434,33 @@ def render_answer(text: str) -> str:
     return safe
 
 
+@dp.errors()
+async def on_error(event: ErrorEvent) -> None:
+    """Любое исключение в обработчике показываем, а не молчим.
+
+    Без этого падение внутри хендлера aiogram только пишет в лог — а владелец
+    на хостинге логов не видит и делает вывод «бот ничего не отвечает».
+    """
+    log.exception("Ошибка в обработчике", exc_info=event.exception)
+    update = event.update
+    message = getattr(update, "message", None)
+    if message is None:
+        return
+    text = str(event.exception)[:300] or event.exception.__class__.__name__
+    try:
+        await message.answer(
+            "Внутренняя ошибка, я её записал в лог:\n"
+            f"<code>{html.escape(text)}</code>\n\n"
+            "Попробуйте ещё раз или другую команду."
+        )
+    except Exception:  # noqa: BLE001 — сообщить не вышло, но процесс ронять нельзя
+        log.warning("не удалось сообщить об ошибке в чат")
+
+
 @dp.message(F.text)
 async def free_text(message: Message) -> None:
     """Любой текст: либо название города, либо вопрос ассистенту."""
-    if not is_allowed(message):
+    if not await guard(message):
         return
     text = (message.text or "").strip()
     if not text:
@@ -439,7 +483,23 @@ async def main() -> None:
     if settings.port:
         start_health_server(storage, settings.port)
     bot = Bot(token=settings.telegram_bot_token)
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, on_startup=[_log_startup])
+
+
+async def _log_startup() -> None:
+    """Печатаем настройки — по логам хостинга сразу видно, что не так.
+
+    Токен и ключи не печатаем, только факт их наличия.
+    """
+    log.info(
+        "Старт: version=%s allowed_user_ids=%s db=%s llm=%s port=%s token=%s",
+        (os.getenv("RENDER_GIT_COMMIT") or "dev")[:7],
+        settings.allowed_user_ids or "все (список не задан)",
+        settings.db_path,
+        settings.llm_provider,
+        settings.port or "нет",
+        "есть" if settings.telegram_bot_token else "НЕТ",
+    )
 
 
 if __name__ == "__main__":
