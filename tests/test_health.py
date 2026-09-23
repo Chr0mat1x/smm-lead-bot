@@ -44,6 +44,7 @@ def test_health_returns_ok_and_counts(running_server) -> None:
     assert payload["status"] == "ok"
     assert payload["leads"] == 1
     assert payload["sent_today"] == 0
+    assert payload["version"], "по /health не видно, какой коммит задеплоен"
 
 
 def test_root_returns_plain_text(running_server) -> None:

@@ -12,10 +12,20 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 log = logging.getLogger("smm_bot.health")
+
+
+def _version() -> str:
+    """Короткий хеш коммита, который сейчас задеплоен.
+
+    Render отдаёт его в RENDER_GIT_COMMIT — по нему видно, подхватил ли сервис
+    последний пуш, не открывая панель хостинга.
+    """
+    return (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "dev")[:7]
 
 
 def _make_handler(storage) -> type[BaseHTTPRequestHandler]:
@@ -28,6 +38,7 @@ def _make_handler(storage) -> type[BaseHTTPRequestHandler]:
                 try:
                     payload = {
                         "status": "ok",
+                        "version": _version(),
                         "leads": storage.total(),
                         "sent_today": storage.sent_today(),
                     }
