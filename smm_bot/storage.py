@@ -150,8 +150,9 @@ class Storage:
     def list_leads(self, status: LeadStatus | None = None, limit: int = 10,
                    order: str = "score DESC, created_at DESC",
                    city: str | None = None, unseen_only: bool = False,
-                   categories: list[str] | str | None = None,
-                   tg_channel_only: bool = False) -> list[Lead]:
+                   categories: list[str] | None = None,
+                   tg_channel_only: bool = False,
+                   contactable_only: bool = False) -> list[Lead]:
         """Список лидов с фильтрами.
 
         Фильтр city обязателен при показе после поиска: без него всплывают
@@ -159,9 +160,12 @@ class Storage:
         так, будто бот искал в Санкт-Петербурге вместо Саратова. По той же
         причине нужен фильтр categories — иначе в выдачу «бани» попадали кафе.
 
-        tg_channel_only оставляет только публичные Telegram-каналы: это
-        основной режим выдачи, потому что писать в канал уместно, а в личный
-        аккаунт — нет.
+        tg_channel_only оставляет только публичные Telegram-каналы.
+
+        contactable_only оставляет тех, кому вообще можно написать: канал или
+        телефон. Это важно, потому что в OSM у российских заведений Telegram
+        почти не указан, а телефон есть у большинства. Раньше выдача требовала
+        канал и была пустой, хотя в базе лежали сотни лидов с телефонами.
         """
         query = "SELECT * FROM leads"
         where: list[str] = []
@@ -184,6 +188,8 @@ class Storage:
             where.append("(shown_at IS NULL OR shown_at = '')")
         if tg_channel_only:
             where.append("tg_kind = 'channel'")
+        if contactable_only:
+            where.append("(tg_kind = 'channel' OR (phone IS NOT NULL AND phone != ''))")
         if where:
             query += " WHERE " + " AND ".join(where)
         query += f" ORDER BY {order} LIMIT ?"
@@ -195,7 +201,8 @@ class Storage:
     def find_by_city(self, city: str, status: LeadStatus | None = None,
                      unseen_only: bool = False,
                      categories: list[str] | str | None = None,
-                     tg_channel_only: bool = False) -> list[Lead]:
+                     tg_channel_only: bool = False,
+                     contactable_only: bool = False) -> list[Lead]:
         """Все лиды города — чтобы «Следующие лиды» не уезжали в другой город.
 
         Город в базе хранится в именительном падеже («Саратов»), а приходит
@@ -206,7 +213,8 @@ class Storage:
         for name in name_variants(city):
             found = self.list_leads(status=status, limit=10000, city=name,
                                     unseen_only=unseen_only, categories=categories,
-                                    tg_channel_only=tg_channel_only)
+                                    tg_channel_only=tg_channel_only,
+                                    contactable_only=contactable_only)
             if found:
                 return found
         return []

@@ -24,7 +24,7 @@ from .config import settings
 from .llm import BaseLLM, LLMError, ToolCall
 from .models import LeadStatus
 from .storage import Storage
-from .tools import ToolBox, category_label
+from .tools import ToolBox, category_label, contact_hint
 
 log = logging.getLogger("smm_bot.agent")
 
@@ -224,13 +224,13 @@ class Agent:
         leads = list(self.storage.find_by_city(
             city, status=LeadStatus.NEW,
             categories=self.toolbox.active_categories or None,
-            tg_channel_only=True))[:3]
+            contactable_only=True))[:3]
         if not leads:
-            return (f"По городу «{city}» лидов с Telegram-каналом нет. "
-                    "Попробуйте другой город: Telegram указывают не все.")
-        lines = [f"{i + 1}. {l.name} ({category_label(l.category)}) — {l.tg.url}"
+            return (f"По городу «{city}» лидов с контактом нет. "
+                    "Попробуйте другой город.")
+        lines = [f"{i + 1}. {l.name} ({category_label(l.category)}) — {contact_hint(l)}"
                  for i, l in enumerate(leads)]
-        return "Лиды с Telegram-каналом:\n" + "\n".join(lines)
+        return "Лиды по приоритету:\n" + "\n".join(lines)
 
     def _reject_and_next(self, lead_key: str) -> str:
         self.toolbox.run("reject_lead", {"lead_key": lead_key,

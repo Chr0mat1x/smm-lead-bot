@@ -55,6 +55,11 @@ class Settings:
     # порт для health-сервера (нужен на хостингах, которые ждут открытый порт)
     port: int = _int(os.getenv("PORT"), 0)
 
+    # Второй источник лидов — открытый датасет Overture Maps (данные Meta,
+    # Microsoft и др. через S3). Ключ не нужен. Если DuckDB не установлен или
+    # сети нет, источник молча отключается и остаётся один OSM.
+    use_overture: bool = os.getenv("USE_OVERTURE", "1").lower() not in ("0", "false", "no")
+
     allowed_user_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:

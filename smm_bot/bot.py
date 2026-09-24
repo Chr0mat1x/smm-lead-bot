@@ -133,6 +133,10 @@ def lead_keyboard(index: int, lead: Lead | None = None) -> InlineKeyboardMarkup:
     if tg is not None and tg.handle:
         # прямая ссылка на канал: одно нажатие вместо копирования @ника
         rows.append([InlineKeyboardButton(text="📣 Открыть Telegram", url=tg.url)])
+    elif lead is not None and lead.phone:
+        # канала может не быть: тогда единственный путь — звонок.
+        # tel: работает на телефоне, на компьютере ссылка просто копируется
+        rows.append([InlineKeyboardButton(text="📞 Позвонить", url=f"tel:{lead.phone}")])
     rows.append([
         InlineKeyboardButton(text="✅ Одобрить", callback_data=f"lead:approve:{index}"),
         InlineKeyboardButton(text="❌ Не подходит", callback_data=f"lead:reject:{index}"),
@@ -225,8 +229,11 @@ async def cmd_help(message: Message) -> None:
         "/reset — очистить историю диалога\n"
         "/stats — статистика базы\n"
         "/csv — выгрузить лиды в файл\n\n"
-        "В выдаче только бизнесы без сайта, у которых есть публичный Telegram-канал: "
-        "у каждого лида видна ссылка и кнопка «Открыть Telegram».\n\n"
+        "В выдаче бизнесы без сайта, которым можно написать: с публичным "
+        "Telegram-каналом или хотя бы с телефоном.\n\n"
+        "Telegram и телефон — разные пути. В канал можно написать сразу, "
+        "кнопка «Открыть Telegram» ведёт прямо туда. По телефону сначала "
+        "согласуйте разговор: кнопка «Позвонить» набирает номер.\n\n"
         "Просто напишите вопрос словами — ассистент ответит.\n"
         "Ответьте (reply) на карточку лида и напишите, что не так — он поправит.\n\n"
         "❗️ Перед отправкой проверьте: у человека должно быть согласие на получение "
@@ -319,11 +326,13 @@ async def show_next_leads(message: Message, place: str | None = None, batch_size
         return storage.find_by_city(
             city, status=LeadStatus.NEW, unseen_only=unseen,
             categories=active_categories.get(message.chat.id) or None,
-            tg_channel_only=True)[:batch_size]
+            contactable_only=True)[:batch_size]
 
-    # Выдаём только лиды с публичным Telegram-каналом: там уместно написать
-    # от лица бизнеса и сразу видно, куда идти. Сначала непоказанные; если
-    # новые кончились — показываем уже виденные, чтобы не было молчания.
+    # Выдаём лиды, которым можно написать: с публичным Telegram-каналом или
+    # хотя бы с телефоном. Требовать только канал нельзя — в OSM у российских
+    # заведений Telegram почти не указан, и выдача была пустой, хотя в базе
+    # лежали сотни лидов с телефонами. Сначала непоказанные; если новые
+    # кончились — показываем уже виденные, чтобы не было молчания.
     leads = pick(unseen=True)
     repeat = False
     if not leads:

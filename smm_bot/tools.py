@@ -42,14 +42,29 @@ def category_label(value: str | None) -> str:
 
     return CATEGORY_LABELS.get(preset or "", value)
 
+
+def contact_hint(lead: Lead) -> str:
+    """Куда писать лиду и по какому каналу.
+
+    Telegram и телефон — не равнозначные пути: в канал можно написать сразу,
+    а по телефону владелец согласует разговор. Поэтому в короткой выдаче
+    показываем оба, чтобы владелец выбирал сам.
+    """
+    tg = lead.tg
+    if tg.kind == "channel" and tg.handle:
+        return f"канал {tg.at or tg.url}"
+    if lead.phone:
+        return f"телефон {lead.phone}"
+    return "контакт не указан"
+
+
 # JSON-схемы для LLM (формат OpenAI tools, для Anthropic конвертируем в llm.py)
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
             "name": "search_leads",
-            "description": "Найти новые бизнесы без сайта в указанном городе и показать "
-                           "только те, у кого есть публичный Telegram-канал со ссылкой. "
+            "description": "Найти новые бизнесы без сайта в указанном городе. "
                            "Use when пользователь просит найти клиентов.",
             "parameters": {
                 "type": "object",
@@ -235,12 +250,13 @@ class ToolBox:
         self.storage.reset_shown_for_city(self.active_city)
 
         def pick(unseen: bool) -> list[Lead]:
-            # только публичные Telegram-каналы: владелец просил выдавать лишь тех,
-            # кому можно написать в TG и дать ссылку на канал
+            # лид годится, если ему вообще можно написать: канал или телефон.
+            # Требовать только канал нельзя — в OSM у российских заведений
+            # Telegram почти не указан, и выдача оставалась пустой.
             return self.storage.find_by_city(
                 self.active_city, status=LeadStatus.NEW, unseen_only=unseen,
                 categories=self.active_categories or None,
-                tg_channel_only=True)[:10]
+                contactable_only=True)[:10]
 
         leads = pick(unseen=True)
         if not leads:
@@ -257,18 +273,18 @@ class ToolBox:
             head = leads[:5]
             lines = [f"{i+1}. {l.name} — {category_label(l.category)}, "
                      f"{l.city or 'адрес неизвестен'}"
-                     f" | канал {l.tg.at or l.tg.url} | скор {l.score} | ключ {l.key}"
+                     f" | {contact_hint(l)} | скор {l.score} | ключ {l.key}"
                      for i, l in enumerate(head)]
-            listing = "\n\nЛиды с Telegram-каналом по приоритету:\n" + "\n".join(lines)
+            listing = "\n\nЛиды по приоритету:\n" + "\n".join(lines)
             if len(leads) > len(head):
                 listing += f"\n...и ещё {len(leads) - len(head)}. Остальные — по кнопке «Следующие лиды»."
         else:
             total = len(self.storage.find_by_city(
                 self.active_city, status=LeadStatus.NEW,
                 categories=self.active_categories or None))
-            listing = ("\n\nЛидов с Telegram-каналом в этом городе не нашлось "
-                       f"(всего бизнесов без сайта: {total}). Telegram указывают "
-                       "далеко не все, поэтому попробуйте другой город или категорию.")
+            listing = ("\n\nЛидов с контактом в этом городе не нашлось "
+                       f"(всего бизнесов без сайта: {total}). Попробуйте другой город "
+                       "или категорию.")
         return {
             "ok": True,
             "result": f"По городу {city_label}: {stats.as_text()}{listing}",
@@ -284,18 +300,18 @@ class ToolBox:
         limit = int(args.get("limit") or 5)
         # Если недавно был поиск по городу — показываем из него, а не всю базу.
         # Категории тоже держим: после «найди бани» не должно быть кафе.
-        # И только каналы: лид без ссылки на канал владельцу бесполезен.
+        # И только те, кому можно написать: канал или телефон.
         leads = self.storage.list_leads(status=status, limit=limit,
                                         city=self.active_city or None,
                                         categories=self.active_categories or None,
-                                        tg_channel_only=True)
+                                        contactable_only=True)
         self.last_shown = [l.key for l in leads]
         if not leads:
             where = f" по городу {self.active_city}" if self.active_city else ""
-            return {"ok": True, "result": f"Лидов с Telegram-каналом со статусом "
+            return {"ok": True, "result": f"Лидов с контактом со статусом "
                                           f"{status.value}{where} нет."}
         lines = [f"{i+1}. {l.name} ({category_label(l.category)}, {l.city}) — "
-                 f"канал {l.tg.at or l.tg.url}, скор {l.score}, ключ {l.key}"
+                 f"{contact_hint(l)}, скор {l.score}, ключ {l.key}"
                  for i, l in enumerate(leads)]
         return {"ok": True, "result": "Найдены лиды:\n" + "\n".join(lines),
                 "data": {"shown_keys": self.last_shown}}
