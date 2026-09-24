@@ -18,6 +18,7 @@ import threading
 from dataclasses import dataclass
 
 from .models import Lead
+from .osm import resolve_spa_category as _resolve_spa
 
 log = logging.getLogger("smm_bot.overture")
 
@@ -52,7 +53,9 @@ CATEGORIES: tuple[Category, ...] = (
     Category("bar", "Бар", "bar",
              ("bar", "pub", "wine_bar", "cocktail_bar", "brewery")),
     Category("banya", "Баня/сауна", "sauna",
-             ("sauna", "bathhouse", "public_bath")),
+             # public_bath_house — то, как Overture в реальности помечает
+             # русские бани; без него настоящие бани не попадали в выдачу
+             ("sauna", "bathhouse", "public_bath", "public_bath_house")),
     Category("barber", "Парикмахерская", "hairdresser",
              ("barber", "hair_salon", "hair_extension_shop", "barber_shop")),
     Category("beauty", "Салон красоты", "beauty",
@@ -108,11 +111,7 @@ def supported_overture_categories(categories: list[str] | None) -> list[str]:
 
 
 # Overture кладёт в одну категорию spa и бани, и салоны красоты, и массаж.
-# По одному названию это не различить, поэтому смотрим на слова в названии.
-_BATH_WORDS = ("баня", "бани", "сауна", "сауны", "bathhouse", "banya", "sauna")
-_BEAUTY_WORDS = ("красот", "beauty", "nail", "ноготоч", "маникюр", "педикюр",
-                 "ресниц", "бров", "brow", "lash", "hair", "barber", "stylist",
-                 "массаж", "massage", "космет", "студия")
+# Список слов общий с OSM (resolve_spa_category), чтобы источники не разошлись.
 
 
 def _disambiguate(category: str, name: str, cat: "Category") -> "Category":
@@ -124,12 +123,7 @@ def _disambiguate(category: str, name: str, cat: "Category") -> "Category":
     """
     if category not in ("spa", "spas", "health_spa"):
         return cat
-    low = (name or "").lower()
-    if any(w in low for w in _BATH_WORDS):
-        return _BY_KEY["banya"]
-    if any(w in low for w in _BEAUTY_WORDS):
-        return _BY_KEY["beauty"]
-    return cat
+    return _BY_KEY["banya"] if _resolve_spa(name) == "sauna" else _BY_KEY["beauty"]
 
 
 def category_for(overture_category: str | None) -> Category | None:

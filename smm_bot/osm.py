@@ -127,6 +127,28 @@ def category_tag_values(categories: list[str] | str | None) -> list[str]:
     return values
 
 
+# `leisure=spa` в OSM, как и `spa` в Overture, — это и бани, и салоны красоты,
+# и массаж. По одному тегу их не различить, поэтому смотрим на слова в названии.
+# Так «Студия красоты» не попадает в категорию «Баня/сауна» и не получает
+# рекламу бани. Логика общая для обоих источников (см. overture.py).
+_BATH_WORDS = ("баня", "бани", "банный", "сауна", "сауны", "bathhouse", "banya", "sauna")
+_BEAUTY_WORDS = ("красот", "beauty", "nail", "ноготоч", "маникюр", "педикюр",
+                 "ресниц", "бров", "brow", "lash", "hair", "barber", "stylist",
+                 "массаж", "massage", "космет", "студия")
+
+
+def resolve_spa_category(name: str) -> str:
+    """Развести бани и салоны внутри неоднозначной категории `spa`.
+
+    Возвращает значение тега OSM: `sauna` для бань, `spa` для салонов.
+    Без подсказки в названии считаем салоном — салонов в этой группе больше.
+    """
+    low = (name or "").lower()
+    if any(w in low for w in _BATH_WORDS):
+        return "sauna"
+    return "spa"
+
+
 @dataclass
 class GeoArea:
     query: str
@@ -409,11 +431,14 @@ def parse_elements(elements: list[dict], city: str, source: str = "osm") -> list
         ] if x)
 
         ref = normalize(telegram)
+        category = _first_tag(tags, "amenity", "shop", "leisure")
+        if category == "spa":
+            category = resolve_spa_category(tags["name"])
         leads.append(Lead(
             source=source,
             source_id=f"{el.get('type')}/{el.get('id')}",
             name=tags["name"].strip(),
-            category=_first_tag(tags, "amenity", "shop", "leisure"),
+            category=category,
             city=city,
             address=address,
             lat=lat,

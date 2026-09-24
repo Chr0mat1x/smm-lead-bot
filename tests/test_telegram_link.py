@@ -58,6 +58,26 @@ def test_parse_rescues_telegram_from_website_field() -> None:
     assert coffee.telegram == "coffeeshop"
 
 
+def test_parse_splits_banya_and_beauty_inside_spa_tag() -> None:
+    """`leisure=spa` — это и бани, и салоны красоты.
+
+    Один и тот же тег у «Баня №10» и у «Студия красоты», поэтому категорию
+    уточняем по названию: иначе салон получал сообщение про баню.
+    """
+    elements = [
+        {"type": "node", "id": 1, "tags": {
+            "name": "Баня №10", "leisure": "spa", "phone": "+7"}},
+        {"type": "node", "id": 2, "tags": {
+            "name": "Студия красоты LiNail", "leisure": "spa", "phone": "+7"}},
+        {"type": "node", "id": 3, "tags": {
+            "name": "Сауна Финская", "leisure": "sauna", "phone": "+7"}},
+    ]
+    by_name = {l.name: l.category for l in parse_elements(elements, city="Казань")}
+    assert by_name["Баня №10"] == "sauna"
+    assert by_name["Студия красоты LiNail"] == "spa"
+    assert by_name["Сауна Финская"] == "sauna"
+
+
 def _fake_lookup(mapping: dict[str, str]):
     """Подменяет обращение к Bot API: возвращает заданный тип для юзернейма."""
     from smm_bot import telegram_link
