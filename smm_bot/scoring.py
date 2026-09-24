@@ -44,6 +44,10 @@ def score_lead(lead: Lead) -> int:
         score += 3
     if lead.phone:
         score += 5
+    # канал даёт конкретную ссылку и открытую площадку для обращения —
+    # такому лиду пишем первым, даже если у него есть телефон
+    if lead.has_tg_channel:
+        score += 15
     score += STATUS_PENALTY.get(lead.status, 0)
     return score
 
@@ -57,3 +61,8 @@ def score_and_sort(leads: list[Lead]) -> list[Lead]:
 def filter_no_website(leads: list[Lead]) -> list[Lead]:
     """Оставляем только тех, у кого нет сайта, и к кому есть чем достучаться."""
     return [l for l in leads if not l.has_website and l.reachable]
+
+
+def filter_tg_channels(leads: list[Lead]) -> list[Lead]:
+    """Только лиды с публичным Telegram-каналом — для выдачи и рассылки в TG."""
+    return [l for l in leads if l.has_tg_channel]

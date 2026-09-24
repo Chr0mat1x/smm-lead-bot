@@ -21,7 +21,10 @@ def make_lead(**kwargs) -> Lead:
 
 
 def test_best_channel_priority() -> None:
-    assert make_lead(telegram="@x", phone="+7").best_channel is Channel.TELEGRAM
+    # Telegram считаем каналом связи только когда подтверждён публичный канал
+    assert make_lead(telegram="@coffeeshop", tg_kind="channel", phone="+7").best_channel is Channel.TELEGRAM
+    # непроверенный Telegram сам по себе каналом не считается — уходим на телефон
+    assert make_lead(telegram="@coffeeshop", phone="+7").best_channel is Channel.PHONE
     assert make_lead(phone="+7").best_channel is Channel.PHONE
     assert make_lead(email="a@b.c").best_channel is Channel.EMAIL
     assert make_lead().best_channel is Channel.NONE
@@ -37,7 +40,8 @@ def test_filter_no_website() -> None:
 
 
 def test_scoring_prefers_tg_and_no_site() -> None:
-    strong = make_lead(source_id="n/1", category="sauna", telegram="@x", has_website=False)
+    strong = make_lead(source_id="n/1", category="sauna", telegram="@coffeeshop", tg_kind="channel",
+                       has_website=False)
     weak = make_lead(source_id="n/2", category="cafe", phone="+7", has_website=True)
     ranked = score_and_sort([weak, strong])
     assert ranked[0] is strong
@@ -45,8 +49,8 @@ def test_scoring_prefers_tg_and_no_site() -> None:
 
 
 def test_dnc_is_pushed_to_bottom() -> None:
-    normal = make_lead(source_id="n/1", category="cafe", telegram="@x")
-    dnc = make_lead(source_id="n/2", category="sauna", telegram="@x", status=LeadStatus.DO_NOT_CONTACT)
+    normal = make_lead(source_id="n/1", category="cafe", telegram="@coffeeshop")
+    dnc = make_lead(source_id="n/2", category="sauna", telegram="@coffeeshop", status=LeadStatus.DO_NOT_CONTACT)
     ranked = score_and_sort([dnc, normal])
     assert ranked[0] is normal
 

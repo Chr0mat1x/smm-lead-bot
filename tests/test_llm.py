@@ -23,6 +23,7 @@ class FakeResponse:
         self._payload = payload
         self.status_code = status_code
         self.text = json.dumps(payload, ensure_ascii=False)
+        self.headers: dict = {}
 
     def json(self) -> dict:
         return self._payload

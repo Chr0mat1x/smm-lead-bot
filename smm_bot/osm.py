@@ -379,14 +379,26 @@ def parse_elements(elements: list[dict], city: str, source: str = "osm") -> list
 
     Объекты без имени пропускаем: без названия в OSM это почти всегда мусор,
     а персональное обращение без имени теряет смысл.
+
+    Отдельный случай — Telegram в поле website. Бизнес без сайта часто пишет
+    там ссылку на свой канал, и раньше такие объекты выбрасывались как «уже
+    есть сайт», хотя сайта у них нет. Такой объект считаем лидом без сайта,
+    а ссылку переносим в telegram.
     """
+    from .telegram_link import looks_like_telegram, normalize
+
     leads: list[Lead] = []
     for el in elements:
         tags = el.get("tags") or {}
         if not tags.get("name"):
             continue
 
-        if _first_tag(tags, "website", "contact:website", "url"):
+        website = _first_tag(tags, "website", "contact:website", "url")
+        telegram = _first_tag(tags, "contact:telegram", "telegram")
+        if website and looks_like_telegram(website):
+            telegram = telegram or website
+            website = ""  # это не сайт, а канал — объект остаётся «без сайта»
+        if website:
             continue  # сайт уже есть — не наш клиент
 
         lat = el.get("lat") or (el.get("center") or {}).get("lat")
@@ -396,6 +408,7 @@ def parse_elements(elements: list[dict], city: str, source: str = "osm") -> list
             _first_tag(tags, "addr:street"), _first_tag(tags, "addr:housenumber")
         ] if x)
 
+        ref = normalize(telegram)
         leads.append(Lead(
             source=source,
             source_id=f"{el.get('type')}/{el.get('id')}",
@@ -410,7 +423,8 @@ def parse_elements(elements: list[dict], city: str, source: str = "osm") -> list
             email=_first_tag(tags, "email", "contact:email"),
             instagram=_first_tag(tags, "contact:instagram"),
             vk=_first_tag(tags, "contact:vk", "vk"),
-            telegram=_first_tag(tags, "contact:telegram", "telegram"),
+            telegram=ref.handle,
+            tg_kind=ref.kind,
             notes=_first_tag(tags, "contact:facebook", "facebook"),
         ))
     return leads

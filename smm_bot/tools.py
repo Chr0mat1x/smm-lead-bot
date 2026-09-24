@@ -48,7 +48,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search_leads",
-            "description": "Найти новые бизнесы без сайта в указанном городе. "
+            "description": "Найти новые бизнесы без сайта в указанном городе и показать "
+                           "только те, у кого есть публичный Telegram-канал со ссылкой. "
                            "Use when пользователь просит найти клиентов.",
             "parameters": {
                 "type": "object",
@@ -234,10 +235,12 @@ class ToolBox:
         self.storage.reset_shown_for_city(self.active_city)
 
         def pick(unseen: bool) -> list[Lead]:
-            return [l for l in self.storage.find_by_city(
-                        self.active_city, status=LeadStatus.NEW, unseen_only=unseen,
-                        categories=self.active_categories or None)
-                    if l.reachable][:10]
+            # только публичные Telegram-каналы: владелец просил выдавать лишь тех,
+            # кому можно написать в TG и дать ссылку на канал
+            return self.storage.find_by_city(
+                self.active_city, status=LeadStatus.NEW, unseen_only=unseen,
+                categories=self.active_categories or None,
+                tg_channel_only=True)[:10]
 
         leads = pick(unseen=True)
         if not leads:
@@ -254,15 +257,18 @@ class ToolBox:
             head = leads[:5]
             lines = [f"{i+1}. {l.name} — {category_label(l.category)}, "
                      f"{l.city or 'адрес неизвестен'}"
-                     f" | {l.phone or l.email or l.instagram or l.telegram or 'контакта нет'}"
-                     f" | скор {l.score} | ключ {l.key}"
+                     f" | канал {l.tg.at or l.tg.url} | скор {l.score} | ключ {l.key}"
                      for i, l in enumerate(head)]
-            listing = "\n\nЛиды по приоритету:\n" + "\n".join(lines)
+            listing = "\n\nЛиды с Telegram-каналом по приоритету:\n" + "\n".join(lines)
             if len(leads) > len(head):
                 listing += f"\n...и ещё {len(leads) - len(head)}. Остальные — по кнопке «Следующие лиды»."
         else:
-            listing = ("\n\nПодходящих лидов в этом городе не нашлось. "
-                       "Предложите другой город или другую категорию.")
+            total = len(self.storage.find_by_city(
+                self.active_city, status=LeadStatus.NEW,
+                categories=self.active_categories or None))
+            listing = ("\n\nЛидов с Telegram-каналом в этом городе не нашлось "
+                       f"(всего бизнесов без сайта: {total}). Telegram указывают "
+                       "далеко не все, поэтому попробуйте другой город или категорию.")
         return {
             "ok": True,
             "result": f"По городу {city_label}: {stats.as_text()}{listing}",
@@ -278,16 +284,18 @@ class ToolBox:
         limit = int(args.get("limit") or 5)
         # Если недавно был поиск по городу — показываем из него, а не всю базу.
         # Категории тоже держим: после «найди бани» не должно быть кафе.
-        leads = [l for l in self.storage.list_leads(status=status, limit=limit,
-                                                    city=self.active_city or None,
-                                                    categories=self.active_categories or None)
-                 if l.reachable]
+        # И только каналы: лид без ссылки на канал владельцу бесполезен.
+        leads = self.storage.list_leads(status=status, limit=limit,
+                                        city=self.active_city or None,
+                                        categories=self.active_categories or None,
+                                        tg_channel_only=True)
         self.last_shown = [l.key for l in leads]
         if not leads:
             where = f" по городу {self.active_city}" if self.active_city else ""
-            return {"ok": True, "result": f"Лидов со статусом {status.value}{where} нет."}
+            return {"ok": True, "result": f"Лидов с Telegram-каналом со статусом "
+                                          f"{status.value}{where} нет."}
         lines = [f"{i+1}. {l.name} ({category_label(l.category)}, {l.city}) — "
-                 f"скор {l.score}, ключ {l.key}"
+                 f"канал {l.tg.at or l.tg.url}, скор {l.score}, ключ {l.key}"
                  for i, l in enumerate(leads)]
         return {"ok": True, "result": "Найдены лиды:\n" + "\n".join(lines),
                 "data": {"shown_keys": self.last_shown}}
@@ -366,7 +374,10 @@ class ToolBox:
 
     def _tool_stats(self, args: dict) -> dict:
         counts = self.storage.counts_by_status()
-        lines = [f"всего: {self.storage.total()}", f"отправлено сегодня: {self.storage.sent_today()}"]
+        lines = [f"всего: {self.storage.total()}",
+                 f"отправлено сегодня: {self.storage.sent_today()}",
+                 f"с публичным Telegram-каналом: {self.storage.count_tg_channels()}",
+                 f"лидов с Telegram без проверки: {len(self.storage.unclassified_tg(10000))}"]
         lines += [f"{k}: {v}" for k, v in sorted(counts.items())]
         return {"ok": True, "result": "Статистика базы:\n" + "\n".join(lines)}
 
@@ -377,9 +388,12 @@ def _describe(lead: Lead) -> str:
         f"ключ: {lead.key}",
         f"статус: {lead.status.value}, скор: {lead.score}, канал: {lead.best_channel.value}",
     ]
-    for label, value in [("телефон", lead.phone), ("telegram", lead.telegram),
-                         ("email", lead.email), ("instagram", lead.instagram),
-                         ("vk", lead.vk), ("адрес", lead.address)]:
+    tg = lead.tg
+    if tg.handle:
+        parts.append(f"telegram: {tg.at or tg.url} ({tg.kind}), ссылка {tg.url}")
+    for label, value in [("телефон", lead.phone), ("email", lead.email),
+                         ("instagram", lead.instagram), ("vk", lead.vk),
+                         ("адрес", lead.address)]:
         if value:
             parts.append(f"{label}: {value}")
     if lead.message:

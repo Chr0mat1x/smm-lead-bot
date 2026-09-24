@@ -24,7 +24,7 @@ from .config import settings
 from .llm import BaseLLM, LLMError, ToolCall
 from .models import LeadStatus
 from .storage import Storage
-from .tools import ToolBox
+from .tools import ToolBox, category_label
 
 log = logging.getLogger("smm_bot.agent")
 
@@ -36,12 +36,16 @@ SYSTEM_PROMPT = """Ты — ассистент, который помогает 
 
 Твоя задача:
 - находить бизнесы БЕЗ сайта (кафе, бани, салоны, автомойки и подобные);
+- показывать только лиды с публичным Telegram-каналом и всегда давать ссылку на него;
 - показывать карточки лидов и готовые персональные письма;
 - когда владелец говорит, что контакт не тот, неподходящий или просит убрать —
   сразу вызывай reject_lead и бери следующий лид;
 - когда просит переписать письмо — вызывай set_message с готовым текстом;
 - когда просит написать кому-то — не отправляй сам, а покажи текст и напомни,
   что отправляет владелец вручную (авторассылка запрещена и банит аккаунт).
+
+Каждый лид в выдаче обязан содержать ссылку вида t.me/имя. Если канала нет,
+не показывай такой лид и честно скажи, что по этому городу каналов не нашлось.
 
 Правила общения: по-русски, коротко, без канцелярита. Не выдумывай данные —
 если чего-то не знаешь, вызови инструмент и посмотри. Если владелец пишет
@@ -83,6 +87,14 @@ class Agent:
                     f"Если он говорит «это не тот», «убери», «не подходит» — "
                     f"относись это именно к лиду {context_lead_key}.]")
         self.storage.add_dialogue(chat_id, "user", user_text + hint, lead_key=context_lead_key or "")
+
+        # Простые команды («найди в Казани», «не тот контакт», «статистика»)
+        # выполняем сами: бесплатная модель часто в очереди и отвечает минуту,
+        # а эти действия должны работать мгновенно и всегда.
+        quick = self.quick_intent(user_text, context_lead_key)
+        if quick is not None:
+            self.storage.add_dialogue(chat_id, "assistant", quick)
+            return quick
 
         try:
             answer = self._run_llm(chat_id)
@@ -149,46 +161,99 @@ class Agent:
     KEYWORDS_REJECT = ("не тот", "не подходит", "не клиент", "убери", "удали", "не по адресу",
                        "спам", "ошибка", "накосячил")
     KEYWORDS_FIND = ("найди", "ищи", "поиск", "поищи")
-    KEYWORDS_SHOW = ("покажи", "следующи", "дальше", "ещё", "еще")
+    KEYWORDS_SHOW = ("покажи", "следующ", "дальше", "ещё", "еще")
     KEYWORDS_STATS = ("стат", "сколько")
     KEYWORDS_DNC = ("не пиши", "не писать", "черный список", "чёрный список")
 
-    def _fallback(self, chat_id: int, user_text: str, context_lead_key: str | None,
-                  reason: str = "") -> str:
-        text = user_text.lower()
+    # Ясные команды распознаём до нейросети. Бесплатная модель то стоит в очереди
+    # (429 «Queue full»), то отвечает минуту — и тогда «бот не работает», хотя
+    # владельцу нужно всего лишь «найди в Казани». Такие фразы разбираем сами,
+    # а нейросеть оставляем для свободного диалога.
+    RE_FIND = re.compile(r"^\s*(?:найди|поищи|ищи|поиск)\b", re.I)
+    RE_SHOW = re.compile(r"^\s*(?:покажи|следующ|дальше|ещё|еще)\b", re.I)
+    # «покажи статистику» начинается как показ, но по смыслу это статистика —
+    # поэтому ищем слово в любом месте и проверяем раньше показа
+    RE_STATS = re.compile(r"\b(?:стат|сколько)\w*", re.I)
 
-        if context_lead_key and any(k in text for k in self.KEYWORDS_REJECT):
-            self.toolbox.run("reject_lead", {"lead_key": context_lead_key,
-                                            "reason": "сказал владелец (без LLM)"})
-            follow = self._next_after(context_lead_key)
-            return ("Убрал этот контакт — он помечен как неподходящий.\n\n"
-                    + (follow or "Следующих подходящих лидов пока нет. Запустите поиск по новому городу."))
+    def quick_intent(self, user_text: str, context_lead_key: str | None = None) -> str | None:
+        """Ответ на очевидную команду без обращения к нейросети.
 
-        if context_lead_key and any(k in text for k in self.KEYWORDS_DNC):
+        Возвращает None, если фраза не распознана — тогда вызывающий код идёт
+        в обычный диалог с моделью.
+        """
+        text = (user_text or "").strip()
+        low = text.lower()
+
+        # ответ на карточку лида: «это не тот контакт» — самое частое действие
+        # владельца, и оно не должно зависеть от доступности нейросети
+        if context_lead_key and any(k in low for k in self.KEYWORDS_DNC):
             self.toolbox.run("do_not_contact", {"lead_key": context_lead_key})
             return "Добавил в чёрный список — этому контакту больше не пишем."
+        if context_lead_key and any(k in low for k in self.KEYWORDS_REJECT):
+            return self._reject_and_next(context_lead_key)
 
-        if any(k in text for k in self.KEYWORDS_FIND):
-            city = self._extract_city(user_text)
-            if city:
-                outcome = self.toolbox.run("search_leads", {"city": city})
-                return outcome["result"] + ("\n\n" + (self._next_after(None) or ""))
-            return "Напишите город: например «найди клиентов в Екатеринбурге»."
+        if self.RE_FIND.match(text):
+            city = self._extract_city(text)
+            if not city:
+                if self.toolbox.active_city:
+                    return self._show_current(self.toolbox.active_city)
+                return ("Напишите город: например «найди клиентов в Екатеринбурге» "
+                        "или «найди кафе с телеграмом в Казани».")
+            return self._find_and_show(city, self._extract_categories(text))
 
-        if any(k in text for k in self.KEYWORDS_STATS):
+        # статистику проверяем раньше показа: «покажи статистику» начинается
+        # со слова-показа, но по смыслу это статистика
+        if self.RE_STATS.search(text):
             return self.toolbox.run("stats", {})["result"]
 
-        if any(k in text for k in self.KEYWORDS_SHOW):
-            return self._next_after(context_lead_key) or "Новых подходящих лидов нет."
+        if self.RE_SHOW.match(text):
+            if not self.toolbox.active_city:
+                return "Сначала поиск: «найди клиентов в Тюмени» — потом покажу лиды."
+            return self._show_current(self.toolbox.active_city)
 
-        if reason:
-            log.warning("причина запасного режима: %s", reason)
+        return None
+
+    def _find_and_show(self, city: str, categories: list[str] | None = None) -> str:
+        args: dict = {"city": city}
+        if categories:
+            args["categories"] = categories
+        outcome = self.toolbox.run("search_leads", args)
+        return str(outcome.get("result", "Поиск не удался."))
+
+    def _show_current(self, city: str) -> str:
+        leads = list(self.storage.find_by_city(
+            city, status=LeadStatus.NEW,
+            categories=self.toolbox.active_categories or None,
+            tg_channel_only=True))[:3]
+        if not leads:
+            return (f"По городу «{city}» лидов с Telegram-каналом нет. "
+                    "Попробуйте другой город: Telegram указывают не все.")
+        lines = [f"{i + 1}. {l.name} ({category_label(l.category)}) — {l.tg.url}"
+                 for i, l in enumerate(leads)]
+        return "Лиды с Telegram-каналом:\n" + "\n".join(lines)
+
+    def _reject_and_next(self, lead_key: str) -> str:
+        self.toolbox.run("reject_lead", {"lead_key": lead_key,
+                                         "reason": "сказал владелец (быстрая команда)"})
+        follow = self._next_after(lead_key)
+        return ("Убрал этот контакт — помечен как неподходящий.\n\n"
+                + (follow or "Следующих каналов в этом городе нет. "
+                             "Запустите поиск по новому городу."))
+
+    def _fallback(self, chat_id: int, user_text: str, context_lead_key: str | None,
+                  reason: str = "") -> str:
+        # Нейросеть недоступна: пробуем понять команду простыми правилами
+        quick = self.quick_intent(user_text, context_lead_key)
+        if quick is not None:
+            return quick
+        log.warning("запасной режим, фраза не распознана: %s", reason)
         return ("Нейросеть сейчас не ответила, поэтому понимаю только простые команды: "
                 "«найди в Тюмени», «покажи следующие», «статистика», или ответьте на карточку лида "
                 "«не тот контакт».\n\n"
-                f"Для разбора у меня сохранена причина: {reason[:300]}\n\n"
+                f"Причина: {reason[:300]}\n\n"
                 "У бесплатного режима (LLM_PROVIDER=pollinations) ключ не нужен — "
-                "проблема на стороне сервиса. Попробуйте написать ещё раз через минуту.")
+                "проблема на стороне сервиса. Напишите ещё раз через минуту.")
+
 
     def _next_after(self, lead_key: str | None) -> str:
         city = self.toolbox.active_city
@@ -212,3 +277,20 @@ class Agent:
             return match.group(1)
         words = [w for w in re.findall(r"[А-ЯЁ][а-яё\-]{2,}", text)]
         return words[0] if words else None
+
+    @staticmethod
+    def _extract_categories(text: str) -> list[str] | None:
+        """Понять из фразы, что именно искать: «кафе», «бани», «барбершоп».
+
+        Без этого «найди кафе в Казани» возвращало салоны красоты: слово
+        «кафе» игнорировалось, и срабатывал список категорий по умолчанию.
+        """
+        from .osm import CATEGORY_ALIASES, CATEGORY_PRESETS
+
+        words = re.findall(r"[а-яёa-z_]+", text.lower())
+        found: list[str] = []
+        for word in words:
+            preset = CATEGORY_ALIASES.get(word) or (word if word in CATEGORY_PRESETS else "")
+            if preset and preset not in found:
+                found.append(preset)
+        return found or None

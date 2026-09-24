@@ -41,6 +41,8 @@ class Lead:
     instagram: str = ""
     vk: str = ""
     telegram: str = ""
+    tg_kind: str = ""  # channel | group | private | invite | unknown
+    tg_title: str = ""
     score: int = 0
     status: LeadStatus = LeadStatus.NEW
     message: str = ""
@@ -51,9 +53,26 @@ class Lead:
         return f"{self.source}:{self.source_id}"
 
     @property
+    def tg(self):
+        """Telegram-контакт в приведённом виде (ссылка, тип, юзернейм)."""
+        from .telegram_link import normalize  # локальный импорт против цикла
+
+        return normalize(self.telegram, kind=self.tg_kind, title=self.tg_title)
+
+    @property
+    def has_tg_channel(self) -> bool:
+        """Есть публичный канал — только такие лиды годятся для рассылки в TG.
+
+        Группу и личный аккаунт сюда не пускаем: в группе писать нельзя без
+        разрешения, а личный аккаунт в OSM чаще всего указан без согласия
+        человека. Канал — единственный канал связи, где обращение уместно.
+        """
+        return self.tg.is_channel
+
+    @property
     def best_channel(self) -> Channel:
         """Канал, по которому с этим лидом реально можно связаться."""
-        if self.telegram:
+        if self.has_tg_channel:
             return Channel.TELEGRAM
         if self.phone:
             return Channel.PHONE

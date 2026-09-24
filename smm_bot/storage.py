@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS leads (
     instagram    TEXT DEFAULT '',
     vk           TEXT DEFAULT '',
     telegram     TEXT DEFAULT '',
+    tg_kind      TEXT DEFAULT '',
+    tg_title     TEXT DEFAULT '',
     score        INTEGER DEFAULT 0,
     status       TEXT DEFAULT 'new',
     message      TEXT DEFAULT '',
@@ -78,6 +80,12 @@ class Storage:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(leads)")}
         if "shown_at" not in columns:
             conn.execute("ALTER TABLE leads ADD COLUMN shown_at TEXT")
+        # тип Telegram-контакта (канал/группа/личный) появился позже:
+        # без него нельзя понять, годится ли лид для обращения в Telegram
+        if "tg_kind" not in columns:
+            conn.execute("ALTER TABLE leads ADD COLUMN tg_kind TEXT DEFAULT ''")
+        if "tg_title" not in columns:
+            conn.execute("ALTER TABLE leads ADD COLUMN tg_title TEXT DEFAULT ''")
 
     @contextmanager
     def _conn(self):
@@ -99,13 +107,13 @@ class Storage:
             if row is None:
                 conn.execute(
                     """INSERT INTO leads (key, source, source_id, name, category, city, address, lat, lon,
-                        has_website, website, phone, email, instagram, vk, telegram, score, status, message,
-                        notes, created_at, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        has_website, website, phone, email, instagram, vk, telegram, tg_kind, tg_title,
+                        score, status, message, notes, created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (lead.key, lead.source, lead.source_id, lead.name, lead.category, lead.city,
                      lead.address, lead.lat, lead.lon, int(lead.has_website), lead.website, lead.phone,
-                     lead.email, lead.instagram, lead.vk, lead.telegram, lead.score, lead.status.value,
-                     lead.message, lead.notes, now, now),
+                     lead.email, lead.instagram, lead.vk, lead.telegram, lead.tg_kind, lead.tg_title,
+                     lead.score, lead.status.value, lead.message, lead.notes, now, now),
                 )
                 return True
 
@@ -121,14 +129,16 @@ class Storage:
                      instagram=COALESCE(NULLIF(?, ''), instagram),
                      vk=COALESCE(NULLIF(?, ''), vk),
                      telegram=COALESCE(NULLIF(?, ''), telegram),
+                     tg_kind=COALESCE(NULLIF(?, ''), tg_kind),
+                     tg_title=COALESCE(NULLIF(?, ''), tg_title),
                      website=COALESCE(NULLIF(?, ''), website),
                      has_website=MAX(has_website, ?),
                      score=MAX(score, ?),
                      updated_at=?
                    WHERE key=?""",
                 (lead.name, lead.category, lead.city, lead.address, lead.phone, lead.email,
-                 lead.instagram, lead.vk, lead.telegram, lead.website, int(lead.has_website),
-                 lead.score, now, lead.key),
+                 lead.instagram, lead.vk, lead.telegram, lead.tg_kind, lead.tg_title, lead.website,
+                 int(lead.has_website), lead.score, now, lead.key),
             )
             return False
 
@@ -140,13 +150,18 @@ class Storage:
     def list_leads(self, status: LeadStatus | None = None, limit: int = 10,
                    order: str = "score DESC, created_at DESC",
                    city: str | None = None, unseen_only: bool = False,
-                   categories: list[str] | str | None = None) -> list[Lead]:
+                   categories: list[str] | str | None = None,
+                   tg_channel_only: bool = False) -> list[Lead]:
         """Список лидов с фильтрами.
 
         Фильтр city обязателен при показе после поиска: без него всплывают
         старые лиды других городов с более высоким скором, и выглядит это
         так, будто бот искал в Санкт-Петербурге вместо Саратова. По той же
         причине нужен фильтр categories — иначе в выдачу «бани» попадали кафе.
+
+        tg_channel_only оставляет только публичные Telegram-каналы: это
+        основной режим выдачи, потому что писать в канал уместно, а в личный
+        аккаунт — нет.
         """
         query = "SELECT * FROM leads"
         where: list[str] = []
@@ -167,6 +182,8 @@ class Storage:
                 params.extend(values)
         if unseen_only:
             where.append("(shown_at IS NULL OR shown_at = '')")
+        if tg_channel_only:
+            where.append("tg_kind = 'channel'")
         if where:
             query += " WHERE " + " AND ".join(where)
         query += f" ORDER BY {order} LIMIT ?"
@@ -177,7 +194,8 @@ class Storage:
 
     def find_by_city(self, city: str, status: LeadStatus | None = None,
                      unseen_only: bool = False,
-                     categories: list[str] | str | None = None) -> list[Lead]:
+                     categories: list[str] | str | None = None,
+                     tg_channel_only: bool = False) -> list[Lead]:
         """Все лиды города — чтобы «Следующие лиды» не уезжали в другой город.
 
         Город в базе хранится в именительном падеже («Саратов»), а приходит
@@ -187,7 +205,8 @@ class Storage:
 
         for name in name_variants(city):
             found = self.list_leads(status=status, limit=10000, city=name,
-                                    unseen_only=unseen_only, categories=categories)
+                                    unseen_only=unseen_only, categories=categories,
+                                    tg_channel_only=tg_channel_only)
             if found:
                 return found
         return []
@@ -218,6 +237,39 @@ class Storage:
         with self._conn() as conn:
             conn.execute("UPDATE leads SET message=?, updated_at=? WHERE key=?",
                          (message, datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds"), key))
+
+    def set_score(self, key: str, score: int) -> None:
+        with self._conn() as conn:
+            conn.execute("UPDATE leads SET score=?, updated_at=? WHERE key=?",
+                         (score, datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds"), key))
+
+    def set_tg_kind(self, key: str, kind: str, title: str = "") -> None:
+        """Записать проверенный тип Telegram-контакта (кеш для будущих поисков)."""
+        with self._conn() as conn:
+            conn.execute("UPDATE leads SET tg_kind=?, tg_title=?, updated_at=? WHERE key=?",
+                         (kind, title, datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds"), key))
+
+    def unclassified_tg(self, limit: int = 500) -> list[Lead]:
+        """Лиды, у которых Telegram есть, но тип ещё не подтверждён.
+
+        Сюда попадают и «unknown» после 429 — их стоит перепроверить, когда
+        лимит Telegram спадёт: раньше такие контакты навсегда гасились как
+        «не найден», и настоящие каналы терялись.
+        """
+        return [l for l in self._all_leads_with_tg(limit)
+                if l.tg_kind in ("", "unknown")]
+
+    def _all_leads_with_tg(self, limit: int) -> list[Lead]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM leads WHERE telegram != '' LIMIT ?", (limit,)).fetchall()
+        return [_row_to_lead(r) for r in rows]
+
+    def count_tg_channels(self) -> int:
+        """Сколько лидов имеют подтверждённый публичный Telegram-канал."""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM leads WHERE tg_kind = 'channel'").fetchone()[0]
 
     def counts_by_status(self) -> dict[str, int]:
         with self._conn() as conn:
@@ -296,6 +348,7 @@ def _row_to_lead(row: sqlite3.Row) -> Lead:
         lat=row["lat"], lon=row["lon"], has_website=bool(row["has_website"]),
         website=row["website"], phone=row["phone"], email=row["email"],
         instagram=row["instagram"], vk=row["vk"], telegram=row["telegram"],
+        tg_kind=row["tg_kind"] or "", tg_title=row["tg_title"] or "",
         score=row["score"], status=LeadStatus(row["status"]), message=row["message"],
         notes=row["notes"],
     )

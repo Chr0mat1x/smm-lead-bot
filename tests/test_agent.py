@@ -99,7 +99,11 @@ def test_unknown_tool_and_missing_lead(storage: Storage) -> None:
 
 
 def test_agent_runs_tool_then_replies(storage: Storage) -> None:
-    """Сценарий: владелец говорит «не тот контакт» -> агент отклоняет лид и отвечает."""
+    """Сценарий: свободная просьба -> агент вызывает инструмент и отвечает.
+
+    Берём фразу, которую не перехватывает быстрый разбор команд: он нужен
+    только для очевидных действий, а всё остальное делает нейросеть.
+    """
     lead = seed_lead(storage)
     llm = ScriptedLLM([
         LLMReply(tool_calls=[ToolCall(id="c1", name="reject_lead",
@@ -108,7 +112,8 @@ def test_agent_runs_tool_then_replies(storage: Storage) -> None:
     ])
     agent = Agent(storage, llm)
 
-    answer = agent.respond(chat_id=1, user_text="это не тот контакт", context_lead_key=lead.key)
+    answer = agent.respond(chat_id=1, user_text="сделай письмо для этого заведения покороче",
+                           context_lead_key=lead.key)
 
     assert answer == "Убрал этот контакт."
     assert storage.get(lead.key).status is LeadStatus.REJECTED
@@ -149,6 +154,36 @@ def test_agent_falls_back_without_llm(storage: Storage) -> None:
 
     stats = agent.respond(chat_id=5, user_text="покажи статистику")
     assert "Статистика" in stats or "всего" in stats.lower()
+
+
+def test_quick_intent_needs_no_llm(storage: Storage) -> None:
+    """«Найди», «статистика» и «не тот контакт» выполняются без нейросети.
+
+    Бесплатная модель часто в очереди (429) и отвечает по минуте — если эти
+    команды зависят от неё, бот выглядит нерабочим, хотя нужное действие
+    можно выполнить сразу.
+    """
+    agent = Agent(storage, ExplodingLLM())
+    assert "Статистика" in agent.respond(chat_id=11, user_text="ещё раз статистику")
+    assert "поиск" in agent.respond(chat_id=11, user_text="покажи следующие").lower()
+    # «покажи статистику» тоже должно пониматься как статистика, а не как показ
+    assert "Статистика" in agent.respond(chat_id=11, user_text="покажи статистику")
+    # фраза без ясной команды уходит к модели, а без модели — честный отказ
+    vague = agent.respond(chat_id=11, user_text="как думаешь, стоит ли писать кафе?")
+    assert "нейросеть" in vague.lower()
+
+
+def test_quick_intent_understands_category(storage: Storage) -> None:
+    """«Найди кафе в Казани» должно искать кафе, а не всё подряд.
+
+    Раньше слово «кафе» терялось, срабатывал список категорий по умолчанию,
+    и в выдачу попадали салоны красоты.
+    """
+    agent = Agent(storage, ExplodingLLM())
+    assert agent._extract_categories("найди кафе в Казани") == ["cafe"]
+    assert agent._extract_categories("найди бани и сауны") == ["banya"]
+    assert agent._extract_categories("найди барбершоп в Твери") == ["barber"]
+    assert agent._extract_categories("найди клиентов в Твери") is None
 
 
 def test_agent_respects_max_steps(storage: Storage) -> None:

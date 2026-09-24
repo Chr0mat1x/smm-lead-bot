@@ -27,7 +27,7 @@ from .health import start_health_server
 from .llm import build_llm
 from .models import Channel, Lead, LeadStatus
 from .osm import category_tag_values
-from .pipeline import export_leads_csv, prepare_messages, run_discovery
+from .pipeline import export_leads_csv, prepare_messages, recheck_telegram, run_discovery
 from .scoring import CATEGORY_WEIGHT
 from .storage import Storage
 from .tools import category_label
@@ -127,14 +127,21 @@ def categories_menu(chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def lead_keyboard(index: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
+def lead_keyboard(index: int, lead: Lead | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    tg = lead.tg if lead is not None else None
+    if tg is not None and tg.handle:
+        # прямая ссылка на канал: одно нажатие вместо копирования @ника
+        rows.append([InlineKeyboardButton(text="📣 Открыть Telegram", url=tg.url)])
+    rows.append([
         InlineKeyboardButton(text="✅ Одобрить", callback_data=f"lead:approve:{index}"),
         InlineKeyboardButton(text="❌ Не подходит", callback_data=f"lead:reject:{index}"),
-    ], [
+    ])
+    rows.append([
         InlineKeyboardButton(text="📨 Отправил вручную", callback_data=f"lead:sent:{index}"),
         InlineKeyboardButton(text="🚫 Не писать", callback_data=f"lead:dnc:{index}"),
-    ]])
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # Кэш текущей выдачи, чтобы кнопки ссылались на конкретные лиды.
@@ -159,8 +166,14 @@ def format_lead(lead: Lead, position: str = "") -> str:
     contact_lines = []
     if lead.phone:
         contact_lines.append(f"📞 {lead.phone}")
-    if lead.telegram:
-        contact_lines.append(f"Telegram: {lead.telegram}")
+    tg = lead.tg
+    if tg.handle:
+        # ссылку даём готовую и кликабельную: владельцу нужно открыть канал,
+        # а не копировать юзернейм руками
+        badge = {"channel": "канал", "group": "группа", "private": "личный аккаунт",
+                 "invite": "закрытая ссылка", "not_found": "не найден",
+                 "unknown": "не проверен"}.get(tg.kind, tg.kind)
+        contact_lines.append(f"📣 Telegram ({badge}): {tg.at or tg.url}\n{tg.url}")
     if lead.instagram:
         contact_lines.append(f"Instagram: {lead.instagram}")
     if lead.vk:
@@ -207,10 +220,13 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "/start — меню\n"
         "/find Москва — найти клиентов в городе\n"
+        "/recheck Москва — перепроверить Telegram у уже найденных\n"
         "/ask вопрос — спросить ассистента\n"
         "/reset — очистить историю диалога\n"
         "/stats — статистика базы\n"
         "/csv — выгрузить лиды в файл\n\n"
+        "В выдаче только бизнесы без сайта, у которых есть публичный Telegram-канал: "
+        "у каждого лида видна ссылка и кнопка «Открыть Telegram».\n\n"
         "Просто напишите вопрос словами — ассистент ответит.\n"
         "Ответьте (reply) на карточку лида и напишите, что не так — он поправит.\n\n"
         "❗️ Перед отправкой проверьте: у человека должно быть согласие на получение "
@@ -300,13 +316,14 @@ async def show_next_leads(message: Message, place: str | None = None, batch_size
         return
 
     def pick(unseen: bool) -> list[Lead]:
-        return [l for l in storage.find_by_city(
-                    city, status=LeadStatus.NEW, unseen_only=unseen,
-                    categories=active_categories.get(message.chat.id) or None)
-                if l.reachable][:batch_size]
+        return storage.find_by_city(
+            city, status=LeadStatus.NEW, unseen_only=unseen,
+            categories=active_categories.get(message.chat.id) or None,
+            tg_channel_only=True)[:batch_size]
 
-    # Сначала только непоказанные. Если в городе новых не осталось — берём
-    # уже показанные, чтобы человек мог вернуться к ним, а не получить молчание.
+    # Выдаём только лиды с публичным Telegram-каналом: там уместно написать
+    # от лица бизнеса и сразу видно, куда идти. Сначала непоказанные; если
+    # новые кончились — показываем уже виденные, чтобы не было молчания.
     leads = pick(unseen=True)
     repeat = False
     if not leads:
@@ -314,15 +331,16 @@ async def show_next_leads(message: Message, place: str | None = None, batch_size
         repeat = True
     if not leads:
         await message.answer(
-            f"По городу «{city}» новых лидов нет.\n"
-            "Попробуйте другой город или другую категорию."
+            f"По городу «{city}» новых лидов с Telegram-каналом нет.\n"
+            "Попробуйте другой город или другую категорию — Telegram указан "
+            "далеко не у всех бизнесов."
         )
         return
 
     current_batch[message.chat.id] = leads
     # название берём у самого лида: там каноническая форма («Саратов»), а не падеж
     shown_city = leads[0].city or city
-    header = f"Город: {shown_city}. Лиды {len(leads)} шт. по приоритету."
+    header = f"Город: {shown_city}. Лиды с Telegram-каналом: {len(leads)} шт. по приоритету."
     if repeat:
         header += "\nЭто уже показанные ранее — новых по городу не осталось."
     await message.answer(
@@ -331,7 +349,7 @@ async def show_next_leads(message: Message, place: str | None = None, batch_size
     )
     for index, lead in enumerate(leads):
         sent = await message.answer(format_lead(lead, position=f"{index + 1}. "),
-                                    parse_mode="HTML", reply_markup=lead_keyboard(index))
+                                    parse_mode="HTML", reply_markup=lead_keyboard(index, lead))
         storage.link_message(message.chat.id, sent.message_id, lead.key)
     if not repeat:
         storage.mark_shown([l.key for l in leads])
@@ -379,6 +397,36 @@ async def export_button(message: Message) -> None:
     path = settings.db_path.parent / "leads_export.csv"
     export_leads_csv(storage, str(path))
     await message.answer_document(FSInputFile(path), caption=f"Выгрузка лидов, всего в базе: {storage.total()}")
+
+
+@dp.message(Command("recheck"))
+async def recheck_cmd(message: Message) -> None:
+    """Перепроверить Telegram у уже сохранённых лидов.
+
+    Нужно после починки проверки каналов: раньше часть контактов помечалась
+    «не найден» из-за лимита Telegram, и без перепроверки настоящие каналы
+    не появятся в выдаче.
+    """
+    if not await guard(message):
+        return
+    city = message.text.removeprefix("/recheck").strip() or None
+    limit = 200
+    note = await message.answer(
+        f"Перепроверяю Telegram{' по ' + city if city else ''} "
+        f"(до {limit} контактов). Это займёт пару минут…")
+    try:
+        checked, channels = await asyncio.to_thread(recheck_telegram, storage, city, limit)
+    except Exception as exc:  # noqa: BLE001 — причину показываем владельцу
+        log.exception("recheck failed")
+        await note.edit_text(f"Не получилось: {exc}")
+        return
+    if not checked:
+        await note.edit_text("Проверять нечего: тип Telegram уже известен у всех лидов.")
+        return
+    await note.edit_text(
+        f"Проверил контактов: {checked}\n"
+        f"Из них оказались каналами: {channels}\n\n"
+        "Теперь «Следующие лиды» показывают только каналы и дают ссылку.")
 
 
 @dp.message(Command("ask"))

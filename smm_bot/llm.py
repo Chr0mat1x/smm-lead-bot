@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -96,6 +97,18 @@ class OpenAICompatibleLLM(BaseLLM):
             if resp.status_code >= 500:
                 last_exc = LLMError(f"LLM вернул HTTP {resp.status_code}: {resp.text[:200]}")
                 time.sleep(0.8 * (attempt + 1))
+                continue
+            if resp.status_code == 429:
+                # бесплатный сервис пускает по одному запросу на IP и отвечает
+                # «Queue full». Секунда-две ожидания обычно решают вопрос —
+                # без этого повтора владелец сразу видел «нейросеть не ответила».
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after) if retry_after else 2.0 * (attempt + 1)
+                except ValueError:
+                    wait = 2.0 * (attempt + 1)
+                last_exc = LLMError(f"LLM вернул HTTP 429 (очередь занята): {resp.text[:200]}")
+                time.sleep(min(wait, 8.0))
                 continue
             if resp.status_code != 200:
                 raise LLMError(f"LLM вернул HTTP {resp.status_code}: {resp.text[:300]}")
@@ -195,6 +208,25 @@ POLLINATIONS_REFERRER = "smm-lead-bot"
 POLLINATIONS_MODELS = ["openai-fast", "openai"]
 POLLINATIONS_MODEL = POLLINATIONS_MODELS[0]  # совместимость с прежним именем
 
+# Бесплатный сервис дописывает в ответ рекламный блок. Владельцу он не нужен,
+# а выглядит как часть ответа ассистента. Отрезаем всё от разделителя.
+_AD_TAIL = re.compile(r"\n+\s*-{3,}\s*\n.*$", re.S)
+_AD_LINE = re.compile(r"^\s*(?:\W*\s*)?(?:Support Pollinations|Sponsored|Ad\b|"
+                      r"Powered by Pollinations)", re.I)
+
+
+def strip_ads(text: str) -> str:
+    """Убрать рекламный хвост бесплатной модели. Текст без рекламы не трогаем."""
+    if not text:
+        return text
+    cleaned = _AD_TAIL.sub("", text)
+    kept: list[str] = []
+    for line in cleaned.splitlines():
+        if _AD_LINE.match(line):
+            break  # с этой строки начинается блок рекламы — дальше уже не ответ
+        kept.append(line)
+    return "\n".join(kept).strip()
+
 
 class PollinationsLLM(BaseLLM):
     """Бесплатный режим без ключа.
@@ -231,11 +263,13 @@ class PollinationsLLM(BaseLLM):
                     errors.append(f"{model}: {exc}")
                     continue
                 if reply.tool_calls or not self._is_quota_refusal(reply):
+                    reply.text = strip_ads(reply.text)
                     return reply
                 last = reply
                 errors.append(f"{model}: отказ по квоте")
                 break  # квота — не наш случай, сразу берём следующую модель
         if last is not None:
+            last.text = strip_ads(last.text)
             return last
         raise LLMError("Бесплатная модель недоступна: " + "; ".join(errors))
 
