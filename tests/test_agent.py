@@ -65,6 +65,70 @@ def test_tools_schemas_include_reject_and_search(storage: Storage) -> None:
     assert {"search_leads", "reject_lead", "set_message", "show_leads", "stats"} <= names
 
 
+def _seed_city(storage: Storage, count: int, city: str = "Казань") -> None:
+    for i in range(count):
+        storage.upsert_lead(Lead(source="osm", source_id=f"n/{i}", name=f"Кафе {i}",
+                                 category="cafe", city=city, phone="+79001234567",
+                                 score=100 - i))
+
+
+def test_show_more_advances_to_new_leads(storage: Storage) -> None:
+    """«Покажи ещё лиды» должно давать новые, а не крутить первую тройку."""
+    _seed_city(storage, 9)
+    agent = Agent(storage, ScriptedLLM([]))
+    agent.toolbox.active_city = "Казань"
+    agent.toolbox.active_categories = ["cafe"]
+
+    first = agent.quick_intent("покажи ещё лиды")
+    second = agent.quick_intent("покажи ещё лиды")
+
+    assert first and second
+    assert first != second, "вторая выдача повторила первую"
+    # все девять должны быть показаны ровно по разу: три итерации по три
+    third = agent.quick_intent("покажи ещё лиды")
+    seen = set()
+    for chunk in (first, second, third):
+        for line in chunk.splitlines()[1:]:
+            seen.add(line.split(".")[1].strip().split(" (")[0])
+    assert seen == {f"Кафе {i}" for i in range(9)}
+
+
+def test_show_more_reports_when_exhausted(storage: Storage) -> None:
+    """Когда непоказанных не осталось — не врём пустотой, а говорим прямо."""
+    _seed_city(storage, 3)
+    agent = Agent(storage, ScriptedLLM([]))
+    agent.toolbox.active_city = "Казань"
+    agent.toolbox.active_categories = ["cafe"]
+
+    agent.quick_intent("покажи ещё лиды")
+    answer = agent.quick_intent("покажи ещё лиды")
+    assert answer is not None
+    assert "не осталось" in answer
+
+
+def test_show_leads_marks_only_displayed_leads_shown(storage: Storage) -> None:
+    """Помечать показанными надо ровно те лиды, что ушли на экран.
+
+    Иначе половина выдачи помечалась показанной, но не показывалась — лид
+    пропадал навсегда: ни в выдаче, ни в «Следующих лидах». Тестируем именно
+    показ (show_leads), а не search_leads: поиск ходит в сеть.
+    """
+    _seed_city(storage, 12)
+    box = ToolBox(storage)
+    box.active_city = "Казань"
+    box.active_categories = ["cafe"]
+    outcome = box.run("show_leads", {"status": "new", "limit": 5})
+    assert outcome["ok"] is True
+
+    shown = box.last_shown
+    assert len(shown) == 5, "на экран уходит пять лидов — столько и помечаем"
+    # помеченные не должны вернуться как непоказанные, остальные — должны
+    unseen = storage.find_by_city("Казань", status=LeadStatus.NEW, unseen_only=True,
+                                  categories=["cafe"], contactable_only=True)
+    assert not (set(shown) & {l.key for l in unseen})
+    assert len(unseen) == 7
+
+
 def test_reject_lead_changes_status(storage: Storage) -> None:
     lead = seed_lead(storage)
     box = ToolBox(storage)

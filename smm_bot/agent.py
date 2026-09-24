@@ -221,13 +221,31 @@ class Agent:
         return str(outcome.get("result", "Поиск не удался."))
 
     def _show_current(self, city: str) -> str:
-        leads = list(self.storage.find_by_city(
-            city, status=LeadStatus.NEW,
-            categories=self.toolbox.active_categories or None,
-            contactable_only=True))[:3]
+        """Показать следующую тройку лидов по городу.
+
+        Раньше здесь бралась просто верхушка города, поэтому «покажи ещё лиды»
+        и «следующие» каждый раз выдавали одни и те же три лида — владелец не
+        мог дойти до остальных. Теперь берём непоказанные и помечаем их
+        показанными (как в кнопке «Следующие лиды»); когда новые кончились —
+        честно говорим об этом, а не крутим первый трофей по кругу.
+        """
+        def pick(unseen: bool) -> list[Lead]:
+            return self.storage.find_by_city(
+                city, status=LeadStatus.NEW, unseen_only=unseen,
+                categories=self.toolbox.active_categories or None,
+                contactable_only=True)[:3]
+
+        leads = pick(unseen=True)
         if not leads:
-            return (f"По городу «{city}» лидов с контактом нет. "
-                    "Попробуйте другой город.")
+            total = len(self.storage.find_by_city(
+                city, status=LeadStatus.NEW,
+                categories=self.toolbox.active_categories or None,
+                contactable_only=True))
+            return (f"По городу «{city}» новых лидов не осталось "
+                    f"(всего с контактом: {total}). Запустите поиск по другому "
+                    "городу или категории.")
+        self.storage.mark_shown([l.key for l in leads])
+        self.toolbox.last_shown = [l.key for l in leads]
         lines = [f"{i + 1}. {l.name} ({category_label(l.category)}) — {contact_hint(l)}"
                  for i, l in enumerate(leads)]
         return "Лиды по приоритету:\n" + "\n".join(lines)

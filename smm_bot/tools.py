@@ -261,16 +261,18 @@ class ToolBox:
         leads = pick(unseen=True)
         if not leads:
             leads = pick(unseen=False)
-        else:
-            self.storage.mark_shown([l.key for l in leads])
-        self.last_shown = [l.key for l in leads]
+
+        # Показываем ровно эти 5 и только их помечаем показанными. Раньше
+        # помечались все 10 из выдачи, а на экран попадало 5 — пятеро лидов
+        # молча пропадали, их не выдавала ни выдача, ни «Следующие лиды».
+        head = leads[:5]
+        self.last_shown = [l.key for l in head]
+        if head:
+            self.storage.mark_shown(self.last_shown)
         city_label = leads[0].city if leads else self.active_city
         # Лиды кладём прямо в результат: иначе модель делает лишний круг
         # «tool -> show_leads -> tool -> ответ» и в сумме отвечает по минуте.
         if leads:
-            # больше пяти не отдаём: модель честно переписывает весь список,
-            # и ответ растёт до минуты
-            head = leads[:5]
             lines = [f"{i+1}. {l.name} — {category_label(l.category)}, "
                      f"{l.city or 'адрес неизвестен'}"
                      f" | {contact_hint(l)} | скор {l.score} | ключ {l.key}"
@@ -301,10 +303,19 @@ class ToolBox:
         # Если недавно был поиск по городу — показываем из него, а не всю базу.
         # Категории тоже держим: после «найди бани» не должно быть кафе.
         # И только те, кому можно написать: канал или телефон.
-        leads = self.storage.list_leads(status=status, limit=limit,
-                                        city=self.active_city or None,
-                                        categories=self.active_categories or None,
-                                        contactable_only=True)
+        # Сначала непоказанные: иначе повторный «покажи лиды» выдавал то же
+        # самое — выдача не двигалась. Если новые кончились, повторяем старые.
+        def query(unseen: bool):
+            return self.storage.list_leads(
+                status=status, limit=limit, city=self.active_city or None,
+                categories=self.active_categories or None,
+                contactable_only=True, unseen_only=unseen)
+
+        leads = query(unseen=True)
+        if not leads:
+            leads = query(unseen=False)
+        else:
+            self.storage.mark_shown([l.key for l in leads])
         self.last_shown = [l.key for l in leads]
         if not leads:
             where = f" по городу {self.active_city}" if self.active_city else ""
